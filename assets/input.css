@@ -1,0 +1,24 @@
+
+@import url('https://fonts.googleapis.com/css2?family=Chewy&family=Gluten:wght@100..900&display=swap');
+
+@import "tailwindcss";
+
+@theme {
+    --font-chewy: "Chewy", "sans-serif"; 
+    --font-gluten: "Gluten", "sans-serif"; 
+}
+
+@media print {
+    header {
+        visibility: hidden;
+    }
+    body {
+      visibility: hidden;
+    }
+    #section-to-print {
+      visibility: visible;
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+  }
