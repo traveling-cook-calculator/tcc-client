@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::vec;
 
 use uuid::Uuid;
-use web_sys::console;
 
 use crate::calculator::{Calculator, Course, Hosting, Plan, Point, Team};
 
@@ -52,6 +51,30 @@ struct Schema {
 }
 
 impl Schema {
+    /// A usable schema lets every team host exactly once and attend every course exactly once.
+    /// (The schemas for 13 and 14 teams do not fulfil this yet; using them used to panic.)
+    fn is_consistent(&self, size: u8) -> bool {
+        if self.plan.len() != size as usize {
+            return false;
+        }
+        let mut attendance: HashMap<(u8, usize), u32> = HashMap::new();
+        let mut hosts = std::collections::HashSet::new();
+        for (key, course) in &self.plan {
+            if *key != course.host || !hosts.insert(course.host) {
+                return false;
+            }
+            let rank = course.course_type.rank();
+            for team in std::iter::once(&course.host).chain(&course.guest_list) {
+                if *team == 0 || *team > size {
+                    return false;
+                }
+                *attendance.entry((*team, rank)).or_default() += 1;
+            }
+        }
+        (1..=size).all(|team| (0..3).all(|rank| attendance.get(&(team, rank)) == Some(&1)))
+    }
+
+
     fn create_mapping(&self, sorted_team_list: &Vec<&Team>) -> HashMap<u8, Uuid> {
         let mut mapping = HashMap::new();
 
@@ -91,11 +114,15 @@ impl<'a> SchemaCalculator<'a> {
         if course_list.len() != 3 {
             return Err("Exactly 3 courses are required in SchemaCalculator".to_string());
         }
+        let valid = |point: &Point| point.latitude.is_finite() && point.longitude.is_finite();
+        if !valid(end_point) || team_list.iter().any(|team| !valid(&team.point)) {
+            return Err("The end point and all teams need valid address coordinates".to_string());
+        }
 
         let mut sorted_course_list = course_list.iter().collect::<Vec<&Course>>();
-        sorted_course_list.sort_by(|a, b| a.time.partial_cmp(&b.time).unwrap());
+        sorted_course_list.sort_by_key(|course| course.time);
 
-        Ok(SchemaCalculator {
+        let calculator = SchemaCalculator {
             schema_list: HashMap::from([
                 (
                     9,
@@ -1093,7 +1120,27 @@ impl<'a> SchemaCalculator<'a> {
             target_lon: end_point.longitude,
             team_list,
             sorted_course_list,
-        })
+        };
+        calculator.check_supported()?;
+        Ok(calculator)
+    }
+
+    /// Teams are split into groups of 9 (the last group takes the remainder, so 9–17 teams).
+    /// Every group needs a consistent schema.
+    fn check_supported(&self) -> Result<(), String> {
+        let team_count = self.team_list.len();
+        let groups = team_count / 9;
+        for index in 0..groups {
+            let size = if index == groups - 1 { 9 + team_count % 9 } else { 9 } as u8;
+            let supported = self.schema_list.get(&size).is_some_and(|schema| schema.is_consistent(size));
+            if !supported {
+                return Err(format!(
+                    "With {team_count} teams one group would have {size} teams, and the plan schema \
+                     for that group size is not available yet. Please add or remove teams."
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1114,38 +1161,17 @@ impl<'a> SchemaCalculator<'a> {
             (CourseType::Dessert, self.sorted_course_list[2].id),
         ]);
 
-        let mut hosting_list = HashMap::new();
-        let mut walking_path = HashMap::new();
+        // Keeps the order of the assigned courses (a HashMap made it random).
+        let hosting_list = assigned_course_list
+            .into_iter()
+            .map(|assigned| Hosting {
+                course: course_mapping[&assigned.course_type],
+                host: assigned.host,
+                guest_list: assigned.guest_list,
+            })
+            .collect();
 
-        for assigned_course in assigned_course_list {
-            let hosting_id = Uuid::new_v4();
-            hosting_list.insert(
-                hosting_id,
-                Hosting {
-                    course: course_mapping
-                        .get(&assigned_course.course_type)
-                        .expect("Course type not found in mapping")
-                        .clone(),
-                    host: assigned_course.host,
-                    guest_list: assigned_course.guest_list.clone(),
-                },
-            );
-            walking_path
-                .entry(assigned_course.host)
-                .or_insert_with(Vec::new)
-                .push(hosting_id);
-            for guest in assigned_course.guest_list {
-                walking_path
-                    .entry(guest)
-                    .or_insert_with(Vec::new)
-                    .push(hosting_id);
-            }
-        }
-
-        Plan {
-            hosting_list,
-            walking_path,
-        }
+        Plan { hosting_list }
     }
 
     fn calculate_angle(&self, team: &Team) -> f64 {
@@ -1170,7 +1196,7 @@ impl<'a> SchemaCalculator<'a> {
             })
             .collect();
 
-        teams_with_angles.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        teams_with_angles.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut group_list = vec![];
 
@@ -1191,22 +1217,7 @@ impl<'a> SchemaCalculator<'a> {
                 .map(|(team, _angle)| (*team, self.calculate_distance(&team.point)))
                 .collect::<Vec<(&Team, f64)>>();
 
-            team_list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-            let debug_string = team_list
-                .iter()
-                .map(|(team, _)| {
-                    format!("&point={}%2C{}", team.point.latitude, team.point.longitude)
-                })
-                .collect::<Vec<String>>()
-                .join("");
-            console::debug_1(
-                &format!(
-                    "https://graphhopper.com/maps/?{}&profile=foot&layer=Omniscale",
-                    debug_string
-                )
-                .into(),
-            );
+            team_list.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             group
                 .sorted_team_list

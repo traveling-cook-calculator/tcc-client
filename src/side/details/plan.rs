@@ -1,272 +1,112 @@
-use crate::side::details::run_schedule::run_schedule::{download, RunSchedule};
-use crate::side::details::run_schedule::{ProjectSchedule, Schedule};
-use crate::side::DownloadSVG;
-use crate::storage::{PlanConfigData, PlanData, TeamData};
-use crate::{
-    side::details::{ErrorPage, LoadingPage},
-    storage::StorageManager,
-};
+//! The schedule sheet of one hosting team.
+
 use dioxus::prelude::*;
 use uuid::Uuid;
-use web_sys::console;
 
-#[component]
-pub fn Plan(cook_and_run_id: Uuid, team_id: Uuid) -> Element {
-    let storage = use_context::<Signal<StorageManager>>();
+use super::run_schedule::run_schedule::{download, RunSchedule};
+use super::run_schedule::Schedule;
+use crate::data::use_storage;
+use crate::storage::mapper::Plan as ResolvedPlan;
+use crate::storage::{PlanConfigData, TeamAccess};
+use crate::ui::*;
 
-    let plan = use_resource(move || {
-        let storage = storage.clone();
-        async move {
-            let storage = storage.read().clone();
-            storage.select_plan_of_cook_and_run(cook_and_run_id).await
-        }
-    });
-
-    let plan_config = use_resource(move || {
-        let storage = storage.clone();
-        async move {
-            let storage = storage.read().clone();
-            storage
-                .select_plan_config_of_cook_and_run(cook_and_run_id)
-                .await
-        }
-    });
-
-    let course_list = use_resource(move || {
-        let storage = storage.clone();
-        async move {
-            let storage = storage.read().clone();
-            storage
-                .select_cook_and_run_course_list(cook_and_run_id)
-                .await
-        }
-    });
-
-    let start_point = use_resource(move || {
-        let storage = storage.clone();
-        async move {
-            let storage = storage.read().clone();
-            storage
-                .select_cook_and_run_start_point(cook_and_run_id)
-                .await
-        }
-    });
-
-    let end_point = use_resource(move || {
-        let storage = storage.clone();
-        async move {
-            let storage = storage.read().clone();
-            storage.select_cook_and_run_end_point(cook_and_run_id).await
-        }
-    });
-
-    let plan = match &*plan.read_unchecked() {
-        None => return rsx!(LoadingPage {}),
-        Some(Err(e)) => {
-            return rsx!(ErrorPage {
-                error_text:
-                    "Could not load project. You may need to log in or the servers may be offline."
-                        .to_string(),
-                error_details: e.clone(),
-            })
-        }
-        Some(Ok(Some(plan))) => plan.clone(),
-        Some(Ok(None)) => {
-            return rsx!(ErrorPage {
-                error_text: "No plan found in project.".to_string(),
-                error_details: "Please come back later, when a plan is generated!",
-            })
-        }
-    };
-
-    let team_list_result = get_relevant_team_list(cook_and_run_id, team_id, &plan);
-    let team_list_resource = if let Ok(team_list_resource) = team_list_result {
-        team_list_resource
-    } else {
-        return rsx!(ErrorPage {
-            error_text: "Internal error.".to_string(),
-            error_details: "Please contact the administrator!",
-        });
-    };
-
-    let mut team_list = vec![];
-    for team_resource in team_list_resource {
-        match &*team_resource.read_unchecked() {
-            None => return rsx!(LoadingPage {}),
-            Some(Err(e)) => {
-                return rsx!(ErrorPage {
-                error_text:
-                    "Could not load project. You may need to log in or the servers may be offline."
-                        .to_string(),
-                error_details: e.clone(),
-            })
-            }
-            Some(Ok(team)) => team_list.push(team.clone()),
-        };
-    }
-
-    let plan_config = match &*plan_config.read_unchecked() {
-        None => return rsx!(LoadingPage {}),
-        Some(Err(e)) => {
-            return rsx!(ErrorPage {
-                error_text:
-                    "Could not load project. You may need to log in or the servers may be offline."
-                        .to_string(),
-                error_details: e.clone(),
-            })
-        }
-        Some(Ok(Some(plan_config))) => plan_config.clone(),
-        Some(Ok(None)) => {
-            return rsx!(ErrorPage {
-                error_text: "No config for a plan found.".to_string(),
-                error_details: "Please come back later, when a config for a plan is generated!",
-            })
-        }
-    };
-
-    let course_list = match &*course_list.read_unchecked() {
-        None => return rsx!(LoadingPage {}),
-        Some(Err(e)) => {
-            return rsx!(ErrorPage {
-                error_text:
-                    "Could not load project. You may need to log in or the servers may be offline."
-                        .to_string(),
-                error_details: e.clone(),
-            })
-        }
-        Some(Ok(course_list)) => course_list.clone(),
-    };
-
-    let start_point = match &*start_point.read_unchecked() {
-        None => return rsx!(LoadingPage {}),
-        Some(Err(e)) => {
-            return rsx!(ErrorPage {
-                error_text:
-                    "Could not load project. You may need to log in or the servers may be offline."
-                        .to_string(),
-                error_details: e.clone(),
-            })
-        }
-        Some(Ok(start_point)) => start_point.clone(),
-    };
-
-    let end_point = match &*end_point.read_unchecked() {
-        None => return rsx!(LoadingPage {}),
-        Some(Err(e)) => {
-            return rsx!(ErrorPage {
-                error_text:
-                    "Could not load project. You may need to log in or the servers may be offline."
-                        .to_string(),
-                error_details: e.clone(),
-            })
-        }
-        Some(Ok(end_point)) => end_point.clone(),
-    };
-
-    let project_schedule = ProjectSchedule::new(&team_list, &course_list, &start_point, &end_point);
-    let plan_schedule = Schedule::new(team_id, &plan, &project_schedule);
-    rsx!(PlanContent {
-        plan_config,
-        schedule: plan_schedule
-    })
+/// Everything the page can end up showing.
+#[derive(Clone)]
+enum PlanPage {
+    NoPlan,
+    NotInPlan,
+    Ready { config: PlanConfigData, schedule: Schedule },
 }
 
-fn get_relevant_team_list(
-    cook_and_run_id: Uuid,
-    team_id: Uuid,
-    plan: &PlanData,
-) -> Result<Vec<Resource<Result<TeamData, String>>>, String> {
-    let relevant_hosting_id_list = plan.walking_path.get(&team_id);
-    let relevant_hosting_id_list = if let Some(relevant_hosting_id_list) = relevant_hosting_id_list
-    {
-        relevant_hosting_id_list
-    } else {
-        console::error_1(
-            &format!(
-                "No walking path for {} forund: {:?}",
-                team_id, plan.walking_path
-            )
-            .into(),
-        );
-        return Err("Team not found in plan!".to_string());
-    };
+#[component]
+pub fn Plan(cook_and_run_id: ReadSignal<Uuid>, team_id: ReadSignal<Uuid>) -> Element {
+    let storage = use_storage();
 
-    let mut relevant_team_id_list = vec![];
+    // One load for the whole page (the old code started one request per involved team,
+    // from inside a loop and behind several early returns).
+    let page = use_resource(move || {
+        let (id, team_id) = (cook_and_run_id(), team_id());
+        async move {
+            let _ = storage.revision();
+            let storage = storage.read().await;
 
-    plan.hosting_list
-        .iter()
-        .filter(|hosting| relevant_hosting_id_list.contains(&hosting.id))
-        .for_each(|hosting| {
-            let host = hosting.host;
-            if host == team_id {
-                let guest_list = hosting.guest_list.clone();
-                relevant_team_id_list.extend(guest_list);
-            }
+            let is_cloud = storage.select_cook_and_run_meta(id).await?.is_in_cloud;
+            let Some(plan) = storage.select_plan_of_cook_and_run(id).await? else {
+                return Ok(PlanPage::NoPlan);
+            };
+            let config = storage.select_plan_config_of_cook_and_run(id).await?.unwrap_or_default();
+            let start = storage.select_cook_and_run_start_point(id).await?;
+            let end = storage.select_cook_and_run_end_point(id).await?;
 
-            relevant_team_id_list.push(host);
-        });
+            let schedule = if is_cloud {
+                // The backend computes the sheet of one team: one request. Resolving it from the
+                // team list would cost one request per team and exceeded the rate limit.
+                let team_plan = storage.select_team_plan(id, team_id, &TeamAccess::Admin).await?;
+                Some(Schedule::from_team_plan(&team_plan, &start, &end))
+            } else {
+                // Local projects: everything is in the browser, no requests involved.
+                let courses = storage.select_cook_and_run_course_list(id).await?;
+                let teams = storage.select_cook_and_run_team_list(id).await?;
+                let resolved = ResolvedPlan::from_plan_data(&plan, &courses, &teams);
+                Schedule::for_team(team_id, &resolved, &start, &end)
+            };
 
-    let storage = use_context::<Signal<StorageManager>>();
+            Ok(match schedule {
+                Some(schedule) => PlanPage::Ready { config, schedule },
+                None => PlanPage::NotInPlan,
+            })
+        }
+    });
 
-    Ok(relevant_team_id_list
-        .iter()
-        .map(|&team_id| {
-            use_resource(move || {
-                let storage = storage.clone();
-                async move {
-                    let storage = storage.read().clone();
-                    storage
-                        .select_cook_and_run_team(cook_and_run_id, team_id)
-                        .await
+    let key = format!("{}-{}", cook_and_run_id(), team_id());
+    render_resource(
+        page,
+        "Could not load the plan. You may need to log in or the servers may be offline.",
+        move |page| match page {
+            PlanPage::NoPlan => rsx! {
+                ErrorView {
+                    error_text: "No plan found in this project.",
+                    error_details: "Please come back later, when a plan has been generated.",
                 }
-            })
-        })
-        .collect::<Vec<_>>())
+            },
+            PlanPage::NotInPlan => rsx! {
+                ErrorView {
+                    error_text: "This team is not part of the plan.",
+                    error_details: "Recalculate the plan to include it.",
+                }
+            },
+            PlanPage::Ready { config, schedule } => rsx! {
+                PlanContent { key: "{key}", config, schedule }
+            },
+        },
+    )
 }
 
 #[component]
-fn PlanContent(plan_config: PlanConfigData, schedule: Schedule) -> Element {
-    let title = plan_config.title.clone();
+pub(crate) fn PlanContent(config: PlanConfigData, schedule: Schedule) -> Element {
+    let download_task = use_busy();
+    let title = config.title.clone();
     let team_name = schedule.host.name.clone();
-
-    let mut hovered = use_signal(|| false);
-
-    let base_style = "
-        position: fixed; bottom: 24px; right: 24px; z-index: 1000;
-        display: flex; align-items: center; justify-content: center;
-        width: 56px; height: 56px; border-radius: 50%;
-        border: none; cursor: pointer; background-color: #C66741;
-        transition: transform 0.15s ease, box-shadow 0.15s ease;
-    ";
-
-    let hover_extra = if hovered() {
-        "transform: scale(1.1); box-shadow: 0 6px 20px rgba(0,0,0,0.3);"
-    } else {
-        "box-shadow: 0 4px 12px rgba(0,0,0,0.2);"
-    };
 
     rsx! {
         button {
-            style: "{base_style}{hover_extra}",
-
-            onmouseenter: move |_| hovered.set(true),
-            onmouseleave: move |_| hovered.set(false),
-
+            r#type: "button",
+            "aria-label": "Download schedule as image",
+            title: "Download as image",
+            class: "fixed bottom-6 right-6 z-40 flex items-center justify-center w-14 h-14 rounded-full \
+                    bg-brand-hover text-white shadow-lg hover:shadow-xl hover:scale-110 \
+                    transition-all duration-150 cursor-pointer",
             onclick: move |_| {
-                let title = title.clone();
-                let team_name =team_name.clone();
-                async move {
-                    download( title.clone(), team_name.clone()).await;
-                }
+                let (title, team_name) = (title.clone(), team_name.clone());
+                download_task.run(async move { download(title, team_name).await });
             },
-
-            DownloadSVG {}
-
+            if download_task.is_busy() {
+                Spinner {}
+            } else {
+                DownloadSVG {}
+            }
         }
 
-        RunSchedule {
-            plan_config,
-            schedule,
-        }
+        RunSchedule { plan_config: config, schedule }
     }
 }

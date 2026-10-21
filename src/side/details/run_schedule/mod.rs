@@ -1,9 +1,9 @@
-use std::collections::HashMap;
-
 use uuid::Uuid;
 
-use crate::storage::{CourseData, HostingData, MeetingPointData, PlanData, TeamData};
+use crate::storage::mapper::Plan as ResolvedPlan;
+use crate::storage::{CourseData, MeetingPointData, TeamData, TeamPlanData};
 
+mod markdown;
 pub mod run_schedule;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12,7 +12,7 @@ pub struct Team {
     address: String,
     mail: Option<String>,
     phone: Option<String>,
-    members: Option<u8>,
+    members: Option<u16>,
     diets: Option<String>,
 }
 
@@ -28,6 +28,7 @@ impl Team {
         }
     }
 }
+
 #[derive(Debug, Clone, PartialEq)]
 struct Course {
     name: String,
@@ -57,43 +58,6 @@ impl MeetingPoint {
             time: meeting_point_data.time.format("%H:%M").to_string(),
             address: meeting_point_data.address.address.clone(),
         }
-    }
-}
-
-pub struct ProjectSchedule {
-    team_map: HashMap<Uuid, Team>,
-    course_map: HashMap<Uuid, Course>,
-    start_point: Option<MeetingPoint>,
-    end_point: Option<MeetingPoint>,
-}
-
-impl ProjectSchedule {
-    pub fn new(
-        team_data_list: &Vec<TeamData>,
-        course_list: &Vec<CourseData>,
-        start_point: &Option<MeetingPointData>,
-        end_point: &Option<MeetingPointData>,
-    ) -> Self {
-        let team_map = team_data_list
-            .iter()
-            .map(|t| (t.id, Team::new(t)))
-            .collect::<std::collections::HashMap<Uuid, Team>>();
-        let course_map = course_list
-            .iter()
-            .map(|c| (c.id, Course::new(c)))
-            .collect::<std::collections::HashMap<Uuid, Course>>();
-
-        let start_meeting_point = start_point.as_ref().map(|s| MeetingPoint::new(s));
-        let end_meeting_point = end_point.as_ref().map(|e| MeetingPoint::new(e));
-
-        let project_schedule = ProjectSchedule {
-            team_map,
-            course_map,
-            start_point: start_meeting_point,
-            end_point: end_meeting_point,
-        };
-
-        project_schedule
     }
 }
 
@@ -192,114 +156,86 @@ impl Schedule {
         }
     }
 
-    pub fn new(team_id: Uuid, plan: &PlanData, project_schedule: &ProjectSchedule) -> Self {
-        let hosting_map = plan
+    /// Schedule sheet of a team from the local resolved plan. `None` if the team is not part of it.
+    /// A team that only visits others has no guests; the sheet then shows its walking path only.
+    pub fn for_team(
+        team_id: Uuid,
+        plan: &ResolvedPlan,
+        start_point: &Option<MeetingPointData>,
+        end_point: &Option<MeetingPointData>,
+    ) -> Option<Self> {
+        let (team, path) = plan.walking_path.iter().find(|(team, _)| team.id == team_id)?;
+
+        // A team that hosts several courses is shown for its earliest one.
+        let guest_list = plan
             .hosting_list
             .iter()
-            .map(|h| (h.id, h))
-            .collect::<std::collections::HashMap<Uuid, &HostingData>>();
+            .filter(|hosting| hosting.host.id == team_id)
+            .min_by_key(|hosting| hosting.course.time)
+            .map(|hosting| hosting.guest_list.iter().map(Team::new).collect())
+            .unwrap_or_default();
 
-        let hosting_data = hosting_map
-            .iter()
-            .find(|(k, v)| v.host == team_id)
-            .expect("Expect to find hosting for team")
-            .1;
-
-        Schedule {
-            host: project_schedule
-                .team_map
-                .get(&hosting_data.host)
-                .expect("Expect host team")
-                .clone(),
-            guest_list: hosting_data
-                .guest_list
+        Some(Schedule {
+            host: Team::new(team),
+            guest_list,
+            walking_path: path
                 .iter()
-                .map(|g| {
-                    project_schedule
-                        .team_map
-                        .get(g)
-                        .expect("Expect guest team")
-                        .clone()
-                })
+                .map(|stop| (Course::new(&stop.course), Team::new(&stop.host)))
                 .collect(),
-            walking_path: plan
-                .walking_path
-                .get(&hosting_data.host)
-                .expect("Expect to find walking path for host")
-                .iter()
-                .map(|c| {
-                    let hosting = hosting_map.get(c).expect("Expect hosting data");
-
-                    let course = project_schedule
-                        .course_map
-                        .get(&hosting.name)
-                        .expect("Expect course")
-                        .clone();
-                    let team = project_schedule
-                        .team_map
-                        .get(&hosting.host)
-                        .expect("Expect host team")
-                        .clone();
-                    (course, team)
-                })
-                .collect(),
-            start_point: project_schedule.start_point.clone(),
-            end_point: project_schedule.end_point.clone(),
-        }
+            start_point: start_point.as_ref().map(MeetingPoint::new),
+            end_point: end_point.as_ref().map(MeetingPoint::new),
+        })
     }
 
-    pub fn new_map(plan: &PlanData, project_schedule: &ProjectSchedule) -> HashMap<Uuid, Self> {
-        let hosting_map = plan
-            .hosting_list
-            .iter()
-            .map(|h| (h.id, h))
-            .collect::<std::collections::HashMap<Uuid, &HostingData>>();
-        let mut schedule_map = HashMap::new();
-        for hosting_data in plan.hosting_list.iter() {
-            let schedule = Schedule {
-                host: project_schedule
-                    .team_map
-                    .get(&hosting_data.host)
-                    .expect("Expect host team")
-                    .clone(),
-                guest_list: hosting_data
-                    .guest_list
-                    .iter()
-                    .map(|g| {
-                        project_schedule
-                            .team_map
-                            .get(g)
-                            .expect("Expect guest team")
-                            .clone()
-                    })
-                    .collect(),
-                walking_path: plan
-                    .walking_path
-                    .get(&hosting_data.host)
-                    .expect("Expect to find walking path for host")
-                    .iter()
-                    .map(|c| {
-                        let hosting = hosting_map.get(c).expect("Expect hosting data");
+    /// Schedule sheet from the backend's personal plan of a team (cloud only). One request;
+    /// building it from the project's team list would need one request per team.
+    pub fn from_team_plan(
+        plan: &TeamPlanData,
+        start_point: &Option<MeetingPointData>,
+        end_point: &Option<MeetingPointData>,
+    ) -> Self {
+        let mut visits: Vec<_> = plan.visitations.iter().collect();
+        visits.sort_by_key(|(course, _)| course.time);
 
-                        let course = project_schedule
-                            .course_map
-                            .get(&hosting.name)
-                            .expect("Expect course")
-                            .clone();
-                        let team = project_schedule
-                            .team_map
-                            .get(&hosting.host)
-                            .expect("Expect host team")
-                            .clone();
-                        (course, team)
-                    })
-                    .collect(),
-                start_point: project_schedule.start_point.clone(),
-                end_point: project_schedule.end_point.clone(),
-            };
-            schedule_map.insert(hosting_data.host, schedule);
+        Schedule {
+            host: Team {
+                name: plan.host.name.clone(),
+                address: plan.host.address.address.clone(),
+                mail: None,
+                phone: plan.host.phone.clone(),
+                members: plan.host.members,
+                diets: plan.host.diets.clone(),
+            },
+            guest_list: plan
+                .host_guest
+                .iter()
+                .map(|guest| Team {
+                    name: guest.name.clone(),
+                    address: String::new(),
+                    mail: None,
+                    phone: guest.phone.clone(),
+                    members: guest.members,
+                    diets: guest.diets.clone(),
+                })
+                .collect(),
+            walking_path: visits
+                .into_iter()
+                .map(|(course, host)| {
+                    (
+                        Course::new(course),
+                        Team {
+                            name: host.name.clone(),
+                            address: host.address.address.clone(),
+                            mail: None,
+                            phone: host.phone.clone(),
+                            members: None,
+                            diets: None,
+                        },
+                    )
+                })
+                .collect(),
+            start_point: start_point.as_ref().map(MeetingPoint::new),
+            end_point: end_point.as_ref().map(MeetingPoint::new),
         }
-
-        schedule_map
     }
 }

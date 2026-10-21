@@ -1,11 +1,42 @@
-
 @import url('https://fonts.googleapis.com/css2?family=Chewy&family=Gluten:wght@100..900&display=swap');
 
 @import "tailwindcss";
 
 @theme {
-    --font-chewy: "Chewy", "sans-serif"; 
-    --font-gluten: "Gluten", "sans-serif"; 
+    --font-chewy: "Chewy", "sans-serif";
+    --font-gluten: "Gluten", "sans-serif";
+
+    /* ── Design tokens (one place for the brand palette) ── */
+    --color-brand: #D67229;        /* primary action / accent */
+    --color-brand-hover: #C66741;  /* hover state of primary action */
+    --color-page: #F8EFE1;         /* page background */
+    --color-surface: #FDFAF6;      /* header / raised surfaces */
+    --color-sand: #F1E7D7;         /* subtle fills, dividers */
+    --color-ink-brown: #70513E;    /* headings / labels */
+
+    /* ── Animations ── */
+    --animate-fade-in: fade-in 0.2s ease-out;
+    --animate-fade-in-up: fade-in-up 0.25s ease-out;
+
+    @keyframes fade-in {
+        from { opacity: 0; }
+        to   { opacity: 1; }
+    }
+    @keyframes fade-in-up {
+        from { opacity: 0; transform: translateY(0.5rem); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+}
+
+/* Shared "saved" flash used by <Card flash=true>. Replaces the per-page
+   inline SAVE_GLOW_CSS strings. */
+@keyframes save-glow {
+    0%   { box-shadow: 0 0 0 0 rgb(34 197 94 / 0.45); }
+    60%  { box-shadow: 0 0 0 6px rgb(34 197 94 / 0.12); }
+    100% { box-shadow: 0 0 0 0 rgb(34 197 94 / 0); }
+}
+.save-glow-card {
+    animation: save-glow 1.6s ease-out;
 }
 
 @media print {

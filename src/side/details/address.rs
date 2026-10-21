@@ -1,274 +1,207 @@
-use crate::{
-    address_connector::get_address,
-    async_action,
-    side::{AddressSVG, AsyncAction, Headline3, InfoSVG, SecondaryButton},
-};
+//! Address input: search via Nominatim ("Automatic") or enter coordinates ("Manual").
+//!
+//! `AddressParam` holds only what the user typed (3 text signals + "show errors").
+//! Errors are *derived* from that text on every render and come from
+//! `AddressData::validate` (the old code kept three extra error signals in sync by hand
+//! and accepted `NaN`, `inf` and `500` as coordinates).
+
 use dioxus::prelude::*;
-use web_sys::console;
 
-use crate::{
-    side::{Input, InputError},
-    storage::AddressData,
-};
+use crate::address_connector::{get_address, Feature, NOT_FOUND};
+use crate::storage::AddressData;
+use crate::ui::*;
 
 // ─────────────────────────────────────────────
-//  Shared label token
+//  State
 // ─────────────────────────────────────────────
 
-const LBL: &str =
-    "block text-[11px] font-semibold tracking-[0.12em] uppercase text-amber-700/70 mb-1.5";
-
-// ─────────────────────────────────────────────
-//  AddressParam (logic unchanged)
-// ─────────────────────────────────────────────
-
-#[derive(PartialEq, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) struct AddressParam {
-    latitude: Signal<String>,
-    latitude_error: Signal<String>,
-    longitude: Signal<String>,
-    longitude_error: Signal<String>,
     address: Signal<String>,
-    address_error: Signal<String>,
-    general_error: Signal<String>,
+    latitude: Signal<String>,
+    longitude: Signal<String>,
+    /// Set by the first submit attempt: from then on empty fields complain as well.
+    show_errors: Signal<bool>,
+}
+
+/// One message per field; empty string = valid.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AddressErrors {
+    pub address: String,
+    pub latitude: String,
+    pub longitude: String,
+}
+
+#[cfg(test)]
+impl AddressErrors {
+    fn is_empty(&self) -> bool {
+        self.address.is_empty() && self.latitude.is_empty() && self.longitude.is_empty()
+    }
+}
+
+fn parse_coordinate(text: &str) -> Result<f64, String> {
+    text.trim()
+        .parse::<f64>()
+        .map_err(|_| "Please enter a valid coordinate.".to_string())
+}
+
+/// Checks the fields one by one against an otherwise valid address.
+fn field_errors(address: &str, latitude: &str, longitude: &str) -> AddressErrors {
+    let probe = |change: &dyn Fn(&mut AddressData)| {
+        let mut data = AddressData {
+            address: "Street 1, 12345 City".to_string(),
+            latitude: 50.0,
+            longitude: 8.0,
+        };
+        change(&mut data);
+        data.validate().err().unwrap_or_default()
+    };
+    AddressErrors {
+        address: probe(&|data| data.address = address.trim().to_string()),
+        latitude: match parse_coordinate(latitude) {
+            Ok(value) => probe(&|data| data.latitude = value),
+            Err(message) => message,
+        },
+        longitude: match parse_coordinate(longitude) {
+            Ok(value) => probe(&|data| data.longitude = value),
+            Err(message) => message,
+        },
+    }
+}
+
+/// The address from the three texts, or the first validation message.
+fn to_address_data(address: &str, latitude: &str, longitude: &str) -> Result<AddressData, String> {
+    let data = AddressData {
+        address: address.trim().to_string(),
+        latitude: parse_coordinate(latitude)?,
+        longitude: parse_coordinate(longitude)?,
+    };
+    data.validate()?;
+    Ok(data)
 }
 
 impl AddressParam {
-    pub(crate) fn new(address: &AddressData) -> Self {
-        let latitude = use_signal(|| {
-            if address.latitude.is_nan() || address.latitude == 0.0 {
-                "".to_string()
-            } else {
-                address.latitude.to_string()
-            }
-        });
-        let latitude_error = use_signal(|| {
-            if address.latitude.is_nan() || address.latitude == 0.0 {
-                "Invalid latitude!".to_string()
-            } else {
-                "".to_string()
-            }
-        });
-
-        let longitude = use_signal(|| {
-            if address.longitude.is_nan() || address.longitude == 0.0 {
-                "".to_string()
-            } else {
-                address.longitude.to_string()
-            }
-        });
-        let longitude_error = use_signal(|| {
-            if address.longitude.is_nan() || address.longitude == 0.0 {
-                "Invalid longitude!".to_string()
-            } else {
-                "".to_string()
-            }
-        });
-
-        let address_signal = use_signal(|| {
-            if address.address.is_empty() {
-                "".to_string()
-            } else {
-                address.address.clone()
-            }
-        });
-        let address_error_signal = use_signal(|| {
-            if address.address.is_empty() {
-                "Address cannot be empty!".to_string()
-            } else {
-                "".to_string()
-            }
-        });
-
+    /// Hooks: call unconditionally in the component body. Pass `AddressData::default()`
+    /// for an empty form (0/0 counts as "not set").
+    pub(crate) fn new(initial: &AddressData) -> Self {
+        let coordinate = |value: f64| {
+            if value.is_finite() && value != 0.0 { value.to_string() } else { String::new() }
+        };
         Self {
-            latitude,
-            latitude_error,
-            longitude,
-            longitude_error,
-            address: address_signal,
-            address_error: address_error_signal,
-            general_error: use_signal(|| "".to_string()),
+            address: use_signal(|| initial.address.clone()),
+            latitude: use_signal(|| coordinate(initial.latitude)),
+            longitude: use_signal(|| coordinate(initial.longitude)),
+            show_errors: use_signal(|| false),
         }
     }
 
-    pub(crate) fn check_address_data(&self) -> Result<(), String> {
-        console::log_1(&"Checking address data...".into());
-        if !check_addr_input(self.address, self.address_error) {
-            return Err("Address cannot be empty!".to_string());
-        }
-        if !check_cord_input(self.latitude, self.latitude_error) {
-            return Err("Invalid coordinate!".to_string());
-        }
-        if !check_cord_input(self.longitude, self.longitude_error) {
-            return Err("Invalid coordinate!".to_string());
-        }
-        Ok(())
+    /// Raw input values. Read-only: safe to call while rendering.
+    pub(crate) fn snapshot(&self) -> (String, String, String) {
+        (self.address.read().clone(), self.latitude.read().clone(), self.longitude.read().clone())
     }
 
+    /// Validation result without side effects (use while rendering).
+    pub(crate) fn current(&self) -> Result<AddressData, String> {
+        let (address, latitude, longitude) = self.snapshot();
+        to_address_data(&address, &latitude, &longitude)
+    }
+
+    /// For submit handlers: reveals all errors in the form, then returns the address.
     pub(crate) fn get_address_data(&self) -> Result<AddressData, String> {
-        let result = self.check_address_data();
-        if result.is_err() {
-            Err(result.expect_err("Error expected"))
-        } else {
-            Ok(AddressData {
-                address: self.address.read().to_string(),
-                latitude: self
-                    .latitude
-                    .read()
-                    .parse::<f64>()
-                    .map_err(|e| format!("Expect latitude to be of type f64: {}", e))?,
-                longitude: self
-                    .longitude
-                    .read()
-                    .parse::<f64>()
-                    .map_err(|e| format!("Expect longitude to be of type f64: {}", e))?,
-            })
+        let mut show_errors = self.show_errors;
+        show_errors.set(true);
+        self.current()
+    }
+
+    /// Errors that should be visible now: everything after a submit attempt,
+    /// before that only fields the user has already filled in.
+    fn visible_errors(&self) -> AddressErrors {
+        let (address, latitude, longitude) = self.snapshot();
+        let all = field_errors(&address, &latitude, &longitude);
+        if *self.show_errors.read() {
+            return all;
+        }
+        let quiet = |text: &str, error: String| if text.trim().is_empty() { String::new() } else { error };
+        AddressErrors {
+            address: quiet(&address, all.address),
+            latitude: quiet(&latitude, all.latitude),
+            longitude: quiet(&longitude, all.longitude),
         }
     }
-}
 
-impl Clone for AddressParam {
-    fn clone(&self) -> Self {
-        Self {
-            latitude: self.latitude.clone(),
-            latitude_error: self.latitude_error.clone(),
-            longitude: self.longitude.clone(),
-            longitude_error: self.longitude_error.clone(),
-            address: self.address.clone(),
-            address_error: self.address_error.clone(),
-            general_error: self.general_error.clone(),
-        }
-    }
-}
-
-impl Default for AddressParam {
-    fn default() -> Self {
-        Self {
-            latitude: use_signal(|| "".to_string()),
-            latitude_error: use_signal(|| "".to_string()),
-            longitude: use_signal(|| "".to_string()),
-            longitude_error: use_signal(|| "".to_string()),
-            address: use_signal(|| "".to_string()),
-            address_error: use_signal(|| "".to_string()),
-            general_error: use_signal(|| "".to_string()),
-        }
+    fn fill(&self, found: &Feature) {
+        let (mut address, mut latitude, mut longitude) = (self.address, self.latitude, self.longitude);
+        address.set(found.formatted());
+        latitude.set(found.lat.to_string());
+        longitude.set(found.lon.to_string());
     }
 }
 
 // ─────────────────────────────────────────────
-//  Address root component
+//  Component
 // ─────────────────────────────────────────────
 
+/// Self-contained: renders its own "Address" heading, callers must not add another label.
 #[component]
 pub(crate) fn Address(param: AddressParam) -> Element {
-    let tab_signal = use_signal(|| true);
-    let auto_param = param.clone();
-    let manual_param = param.clone();
+    let mut mode = use_signal(|| 0usize);
 
-    rsx!(
-        // Section label with icon
-        div { class: "flex items-center gap-1.5 mb-3",
-            AddressSVG {}
-            Headline3 { headline: "Address" }
+    rsx! {
+        div { class: "space-y-3",
+            div { class: "flex items-center gap-1.5",
+                AddressSVG {}
+                Headline3 { headline: "Address" }
+            }
+            Tabs {
+                tabs: vec!["Automatic", "Manual"],
+                selected: mode(),
+                onselect: move |index| mode.set(index),
+            }
+            if mode() == 0 {
+                AutoAddress { param }
+            } else {
+                ManualAddress { param }
+            }
         }
-
-        // Tab bar
-        TabBar { tab_signal }
-
-        if *tab_signal.read() {
-            AutoAddress { param: auto_param }
-        } else {
-            ManualAddress { param: manual_param }
-        }
-    )
+    }
 }
 
 // ─────────────────────────────────────────────
-//  Tab bar
+//  Automatic: Nominatim search
 // ─────────────────────────────────────────────
 
 #[component]
-fn TabBar(tab_signal: Signal<bool>) -> Element {
-    let active_cls =
-        "px-4 py-2 text-sm font-semibold text-[#C66741] border-b-2 border-[#C66741] -mb-px";
-    let inactive_cls =
-        "px-4 py-2 text-sm font-medium text-zinc-500 hover:text-[#C66741] transition-colors";
+fn AutoAddress(param: AddressParam) -> Element {
+    let search_task = use_busy();
+    let mut query = use_signal(String::new);
+    let mut search_error = use_signal(|| None::<String>);
 
-    rsx!(
-        div { class: "flex border-b border-amber-100 mb-4",
-            button {
-                r#type: "button",
-                id: "tab-search",
-                class: if *tab_signal.read() { active_cls } else { inactive_cls },
-                onclick: move |_| { tab_signal.set(true); },
-                "Automatic"
-            }
-            button {
-                r#type: "button",
-                id: "tab-coords",
-                class: if !*tab_signal.read() { active_cls } else { inactive_cls },
-                onclick: move |_| { tab_signal.set(false); },
-                "Manual"
-            }
-        }
-    )
-}
-
-// ─────────────────────────────────────────────
-//  Auto address (Nominatim search)
-// ─────────────────────────────────────────────
-
-#[component]
-fn AutoAddress(mut param: AddressParam) -> Element {
-    let mut is_searching_signal = use_signal(|| false);
-    let mut address_search_signal = use_signal(|| "".to_string());
-    let address_search_error_signal = use_signal(|| "".to_string());
-    let mut address_search_response_error_signal = use_signal(|| "".to_string());
-
-    let search_action: AsyncAction = async_action!({
-        console::log_1(&"Start async searching for address!".into());
-        if !check_addr_input(address_search_signal, address_search_error_signal) {
-            is_searching_signal.set(false);
+    let on_search = move |_| {
+        let text = query.peek().trim().to_string();
+        if text.is_empty() {
+            search_error.set(Some("Please enter an address to search for.".to_string()));
             return;
         }
-        let search_address = address_search_signal.read().to_string();
-        match get_address(&search_address).await {
-            Ok(address) => {
-                let addr_data = format!(
-                    "{} {}, {} {}",
-                    address.address.clone().road.unwrap_or("-".to_string()),
-                    address
-                        .address
-                        .clone()
-                        .house_number
-                        .unwrap_or("-".to_string()),
-                    address.address.clone().postcode.unwrap_or("-".to_string()),
-                    address.address.clone().get_city(),
-                );
-                param.address.set(addr_data);
-                param.address_error.set("".to_string());
-                param.latitude.set(address.lat.to_string());
-                param.latitude_error.set("".to_string());
-                param.longitude.set(address.lon.to_string());
-                param.longitude_error.set("".to_string());
-                address_search_response_error_signal.set("".to_string());
+        search_error.set(None);
+        search_task.run(async move {
+            match get_address(&text).await {
+                Ok(found) => param.fill(&found),
+                Err(e) if e == NOT_FOUND => search_error.set(Some("No address found!".to_string())),
+                Err(e) => search_error.set(Some(e)),
             }
-            Err(e) => {
-                console::error_1(&format!("Error getting coordinates: {}", e).into());
-                address_search_response_error_signal.set("No address found!".to_string());
-            }
-        }
-        is_searching_signal.set(false);
-        console::log_1(&"Finished searching for address!".into());
-    });
+        });
+    };
 
-    rsx!(
-        div { id: "address-search", class: "space-y-1",
+    let current = param.address.read().clone();
+    let stored_error = param.visible_errors().address;
 
-            // Label + privacy tooltip
-            div { class: "flex items-center justify-between mb-1.5",
-                label { class: "{LBL}", "Search Address" }
-                span { class: "relative group cursor-pointer",
+    rsx! {
+        div { class: "space-y-2",
+            div { class: "flex items-center justify-between",
+                span { class: "text-[11px] font-semibold tracking-[0.12em] uppercase text-amber-700/70",
+                    "Search Address"
+                }
+                span { class: "relative group cursor-help",
                     InfoSVG {}
                     span { class: "absolute bottom-full right-0 mb-1.5 hidden group-hover:block \
                                    bg-zinc-800 text-white text-xs rounded-xl \
@@ -278,146 +211,115 @@ fn AutoAddress(mut param: AddressParam) -> Element {
                 }
             }
 
-            Input {
-                place_holer: Some("Street, City, ZIP code".to_string()),
-                value: address_search_signal.clone(),
-                is_error: !address_search_error_signal.read().is_empty(),
+            TextInput {
+                value: query(),
+                placeholder: "Street, City, ZIP code",
+                error: search_error.read().is_some(),
                 oninput: move |e: Event<FormData>| {
-                    let address = e.value();
-                    address_search_signal.set(address);
-                    let _ = check_addr_input(address_search_signal, address_search_error_signal);
+                    query.set(e.value());
+                    search_error.set(None);
                 },
             }
+            Button {
+                label: "Search",
+                variant: ButtonVariant::Secondary,
+                loading: search_task.is_busy(),
+                onclick: on_search,
+            }
 
-            InputError { error: address_search_error_signal.read() }
-
-            SecondaryButton { text: "Search".to_string(), action: search_action }
-
-            // Result / status row
-            div { class: "mt-3 flex items-start gap-2 text-sm min-h-[1.5rem]",
-
-                if !address_search_response_error_signal.read().is_empty() {
-                    // Error
-                    InputError { error: address_search_response_error_signal.read() }
-                } else if !param.address.read().is_empty() {
-                    // Success – show found address
-                    svg {
-                        class: "w-4 h-4 shrink-0 mt-0.5 text-amber-500",
-                        xmlns: "http://www.w3.org/2000/svg",
-                        fill: "none",
-                        view_box: "0 0 24 24",
-                        stroke_width: "2",
-                        stroke: "currentColor",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            d: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z",
-                        }
-                    }
-                    span { class: "text-zinc-600 leading-snug", "{param.address}" }
-                } else if !param.address_error.read().is_empty() {
-                    // Validation error on the stored address
-                    InputError { error: param.address_error.read() }
+            div { class: "flex items-start gap-2 text-sm min-h-6",
+                if let Some(message) = search_error() {
+                    FieldError { error: message }
+                } else if !current.is_empty() {
+                    CheckSVG {}
+                    span { class: "text-zinc-600 leading-snug", "{current}" }
+                } else if !stored_error.is_empty() {
+                    FieldError { error: stored_error }
                 } else {
-                    // Empty state
-                    svg {
-                        class: "w-4 h-4 shrink-0 mt-0.5 text-zinc-300",
-                        xmlns: "http://www.w3.org/2000/svg",
-                        fill: "none",
-                        view_box: "0 0 24 24",
-                        stroke_width: "2",
-                        stroke: "currentColor",
-                        path {
-                            stroke_linecap: "round",
-                            stroke_linejoin: "round",
-                            d: "M12 4.5v15m7.5-7.5h-15",
-                        }
-                    }
                     span { class: "text-zinc-400", "No address set" }
                 }
             }
         }
-    )
-}
-
-// ─────────────────────────────────────────────
-//  Manual address (coordinate entry)
-// ─────────────────────────────────────────────
-
-#[component]
-fn ManualAddress(mut param: AddressParam) -> Element {
-    rsx!(
-        div { id: "coordinates", class: "space-y-1",
-
-            div {
-                label { class: "{LBL}", "Latitude" }
-                Input {
-                    place_holer: Some("e.g. 50.1127197".to_string()),
-                    value: param.latitude.read(),
-                    is_error: !param.latitude_error.read().is_empty(),
-                    oninput: move |e: Event<FormData>| {
-                        param.latitude.set(e.value());
-                        let _ = check_cord_input(param.latitude, param.latitude_error);
-                    },
-                }
-                InputError { error: param.latitude_error.read() }
-            }
-
-            div {
-                label { class: "{LBL}", "Longitude" }
-                Input {
-                    place_holer: Some("e.g. 8.682092".to_string()),
-                    value: param.longitude.read(),
-                    is_error: !param.longitude_error.read().is_empty(),
-                    oninput: move |e: Event<FormData>| {
-                        param.longitude.set(e.value());
-                        let _ = check_cord_input(param.longitude, param.longitude_error);
-                    },
-                }
-                InputError { error: param.longitude_error.read() }
-            }
-
-            div {
-                label { class: "{LBL}", "Address" }
-                Input {
-                    place_holer: Some("e.g. Main Street 1, 12345 City".to_string()),
-                    value: param.address.read(),
-                    is_error: !param.address_error.read().is_empty(),
-                    oninput: move |e: Event<FormData>| {
-                        param.address.set(e.value());
-                        let _ = check_addr_input(param.address, param.address_error);
-                    },
-                }
-                InputError { error: param.address_error.read() }
-            }
-        }
-    )
-}
-
-// ─────────────────────────────────────────────
-//  Validation helpers (logic unchanged)
-// ─────────────────────────────────────────────
-
-fn check_addr_input(input_signal: Signal<String>, mut error_signal: Signal<String>) -> bool {
-    if input_signal.read().trim().is_empty() {
-        error_signal.set("Address cannot be empty!".to_string());
-        false
-    } else {
-        error_signal.set("".to_string());
-        true
     }
 }
 
-fn check_cord_input(input_signal: Signal<String>, mut error_signal: Signal<String>) -> bool {
-    let read_value = input_signal.read();
-    match read_value.parse::<f64>() {
-        Ok(_) => {
-            error_signal.set("".to_string());
-            true
+// ─────────────────────────────────────────────
+//  Manual: coordinates
+// ─────────────────────────────────────────────
+
+#[component]
+fn ManualAddress(param: AddressParam) -> Element {
+    let (mut address, mut latitude, mut longitude) = (param.address, param.latitude, param.longitude);
+    let errors = param.visible_errors();
+    let (current_address, current_latitude, current_longitude) = param.snapshot();
+
+    rsx! {
+        div { class: "space-y-4",
+            Field { label: "Latitude", error: errors.latitude.clone(),
+                TextInput {
+                    value: current_latitude,
+                    placeholder: "e.g. 50.1127197",
+                    error: !errors.latitude.is_empty(),
+                    oninput: move |e: Event<FormData>| latitude.set(e.value()),
+                }
+            }
+            Field { label: "Longitude", error: errors.longitude.clone(),
+                TextInput {
+                    value: current_longitude,
+                    placeholder: "e.g. 8.682092",
+                    error: !errors.longitude.is_empty(),
+                    oninput: move |e: Event<FormData>| longitude.set(e.value()),
+                }
+            }
+            Field { label: "Address", error: errors.address.clone(),
+                TextInput {
+                    value: current_address,
+                    placeholder: "e.g. Main Street 1, 12345 City",
+                    error: !errors.address.is_empty(),
+                    oninput: move |e: Event<FormData>| address.set(e.value()),
+                }
+            }
         }
-        Err(_) => {
-            error_signal.set("Invalid coordinate!".to_string());
-            false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_input_has_no_errors() {
+        assert!(field_errors("Main Street 1", "50.1", "8.6").is_empty());
+        assert!(to_address_data("Main Street 1", "50.1", "8.6").is_ok());
+    }
+
+    #[test]
+    fn each_field_reports_its_own_error() {
+        let errors = field_errors("", "50.1", "8.6");
+        assert!(!errors.address.is_empty() && errors.latitude.is_empty() && errors.longitude.is_empty());
+        let errors = field_errors("Main Street 1", "abc", "8.6");
+        assert!(errors.address.is_empty() && !errors.latitude.is_empty() && errors.longitude.is_empty());
+        let errors = field_errors("Main Street 1", "50.1", "");
+        assert!(errors.address.is_empty() && errors.latitude.is_empty() && !errors.longitude.is_empty());
+    }
+
+    #[test]
+    fn out_of_range_and_non_finite_coordinates_are_rejected() {
+        // The old check accepted everything `f64::parse` accepts.
+        for bad in ["91", "-91", "NaN", "inf", "-inf", "1e308"] {
+            assert!(!field_errors("Main Street 1", bad, "8.6").latitude.is_empty(), "latitude '{bad}'");
+            assert!(to_address_data("Main Street 1", bad, "8.6").is_err(), "latitude '{bad}'");
         }
+        for bad in ["181", "-181", "NaN"] {
+            assert!(!field_errors("Main Street 1", "50.1", bad).longitude.is_empty(), "longitude '{bad}'");
+        }
+        assert!(to_address_data("Main Street 1", "90", "-180").is_ok());
+    }
+
+    #[test]
+    fn surrounding_whitespace_is_ignored() {
+        let data = to_address_data("  Main Street 1 ", " 50.1 ", " 8.6 ").unwrap();
+        assert_eq!(data.address, "Main Street 1");
+        assert_eq!((data.latitude, data.longitude), (50.1, 8.6));
     }
 }

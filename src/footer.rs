@@ -29,7 +29,7 @@ pub fn Footer() -> Element {
 
     rsx! {
         footer {
-            class: "bg-[#FDFAF6] border-t border-amber-200/60",
+            class: "bg-surface border-t border-amber-200/60",
             div {
                 class: "max-w-7xl mx-auto px-6 py-5 \
                         flex flex-col sm:flex-row \

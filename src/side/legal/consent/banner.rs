@@ -29,7 +29,7 @@ pub fn CookieBanner() -> Element {
         // ── Bottom-Bar ───────────────────────────────────────────────────
         div {
             class: "fixed bottom-0 left-0 right-0 z-[90] \
-                    bg-[#FDFAF6]/97 backdrop-blur-sm \
+                    bg-surface/97 backdrop-blur-sm \
                     border-t border-amber-200/60 \
                     shadow-[0_-4px_24px_rgba(0,0,0,0.07)]",
 
@@ -94,8 +94,8 @@ pub fn CookieBanner() -> Element {
                     // Akzeptieren
                     button {
                         class: "px-4 py-2 rounded-xl text-sm font-medium \
-                                bg-[#D67229] text-white \
-                                hover:bg-[#C66741] \
+                                bg-brand text-white \
+                                hover:bg-brand-hover \
                                 transition-colors duration-150 cursor-pointer",
                         onclick: {
                             let v = version.clone();

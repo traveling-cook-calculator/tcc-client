@@ -1,9 +1,9 @@
 use base64::engine::general_purpose;
 use base64::Engine;
 use chrono::NaiveDateTime;
-use js_sys::Math;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 use web_sys::{console, window};
 
 use crate::config::AuthConfig;
@@ -103,7 +103,11 @@ impl SessionData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessData {
     pub code_verifier: String,
+    /// Random one-time value, compared with the `state` that comes back from Keycloak.
     pub state: String,
+    /// Route (URL path) the user wants to land on after the login.
+    #[serde(default)]
+    pub return_to: String,
 }
 
 impl ProcessData {
@@ -143,17 +147,25 @@ impl AuthState {
             return auth_state.refresh().await;
         }
 
-        console::debug_1(&"No valid session found, checking for ongoing auth process...".into());
         if let Some(process_data) = ProcessData::load() {
-            console::debug_1(&"Process data loaded".into());
-            return AuthState::Loading(config, oidc_discovery, process_data);
+            if on_callback_route() {
+                console::debug_1(&"Login response is being processed".into());
+                return AuthState::Loading(config, oidc_discovery, process_data);
+            }
+            // A login was started but never finished (tab closed, back button, …). The stored data
+            // is stale: keeping it made the app wait for a response that will never come.
+            console::debug_1(&"Discarding an abandoned login attempt".into());
+            let _ = ProcessData::clear();
         }
 
         console::debug_1(&"No ongoing auth process, user is logged out".into());
         AuthState::LoggedOut(config, oidc_discovery)
     }
 
-    pub async fn login(self, state: String) -> (Self, Option<String>) {
+    /// Starts the login. Returns the Keycloak URL to navigate to. The app state stays
+    /// `LoggedOut`: the page is left right away, and `Loading` only makes sense on the callback
+    /// page (a restored page – back button – would otherwise show a spinner forever).
+    pub async fn login(self, return_to: String) -> (Self, Option<String>) {
         console::debug_1(&"Starting Keycloak login process...".into());
 
         let (config, oidc_discovery) = match self {
@@ -173,9 +185,11 @@ impl AuthState {
         let code_verifier = generate_random_string(128);
         let code_challenge = generate_code_challenge(&code_verifier);
 
+        let state = generate_random_string(32);
         let process_data = ProcessData {
             code_verifier,
             state: state.clone(),
+            return_to,
         };
 
         if let Err(e) = process_data.save() {
@@ -200,15 +214,12 @@ impl AuthState {
             code_challenge,
         );
 
-        console::debug_1(&format!("Keycloak auth URL: {}", auth_url).into());
-        (
-            AuthState::Loading(config, oidc_discovery, process_data),
-            Some(auth_url),
-        )
+        (AuthState::LoggedOut(config, oidc_discovery), Some(auth_url))
     }
 
     pub async fn callback(self, code: &str, state: &str) -> Self {
-        console::debug_1(&format!("Handling callback – code: {}, state: {}", code, state).into());
+        // (the authorization code and the state are not logged)
+        console::debug_1(&"Handling login callback...".into());
 
         let (config, discovery, process_data) = match self {
             AuthState::Loading(config, discovery, p) => (config, discovery, p),
@@ -477,14 +488,27 @@ async fn exchange_code_for_token(
         .map_err(|e| format!("Error parsing token response: {}", e))
 }
 
+/// Cryptographically secure random string (`[0-9a-f]`, allowed for PKCE verifiers).
+/// Uses UUID v4, which draws from `crypto.getRandomValues` in the browser – the previous
+/// `Math.random()` is predictable and must not be used for PKCE or `state`.
 fn generate_random_string(length: usize) -> String {
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
-    (0..length)
-        .map(|_| {
-            let idx = (Math::random() * CHARSET.len() as f64) as usize;
-            CHARSET[idx.min(CHARSET.len() - 1)] as char
-        })
-        .collect()
+    let mut out = String::with_capacity(length + 32);
+    while out.len() < length {
+        out.push_str(&Uuid::new_v4().simple().to_string());
+    }
+    out.truncate(length);
+    out
+}
+
+/// The login response arrives on `/callback` (see `Route::Callback`).
+fn is_callback_path(path: &str) -> bool {
+    path.trim_end_matches('/').ends_with("/callback")
+}
+
+fn on_callback_route() -> bool {
+    window()
+        .and_then(|window| window.location().pathname().ok())
+        .is_some_and(|path| is_callback_path(&path))
 }
 
 fn generate_code_challenge(code_verifier: &str) -> String {
@@ -522,4 +546,43 @@ async fn fetch_discovery(config: &AuthConfig) -> Result<OidcDiscovery, String> {
         .map_err(|e| format!("Error parsing OIDC discovery response: {}", e))?;
 
     Ok(discovery)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pkce_challenge_matches_the_rfc_7636_example() {
+        // RFC 7636, appendix B.
+        assert_eq!(
+            generate_code_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+    }
+
+    #[test]
+    fn random_strings_have_the_requested_length_and_allowed_characters() {
+        for length in [1, 31, 32, 33, 43, 128] {
+            let value = generate_random_string(length);
+            assert_eq!(value.len(), length);
+            assert!(value.chars().all(|c| c.is_ascii_hexdigit()), "{value}");
+        }
+    }
+
+    #[test]
+    fn random_strings_do_not_repeat() {
+        let all: std::collections::HashSet<String> = (0..200).map(|_| generate_random_string(128)).collect();
+        assert_eq!(all.len(), 200);
+    }
+
+    #[test]
+    fn only_the_callback_path_counts_as_callback() {
+        assert!(is_callback_path("/callback"));
+        assert!(is_callback_path("/callback/"));
+        assert!(is_callback_path("/app/callback"));
+        assert!(!is_callback_path("/"));
+        assert!(!is_callback_path("/cook-and-run/1/overview"));
+        assert!(!is_callback_path("/callbacks"));
+    }
 }

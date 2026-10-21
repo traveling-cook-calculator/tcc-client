@@ -1,15 +1,22 @@
-use chrono::{NaiveDateTime, Utc};
+use chrono::Utc;
 use uuid::Uuid;
 
 use super::{CookAndRunData, CookAndRunMetaData};
 
 use crate::storage::{
     CookAndRunCreate, CookAndRunMetaUpdate, CourseCreate, CourseData, CourseUpdate,
-    MeetingPointData, NoteCreate, PlanData, Storage, TeamCreate, TeamData, TeamUpdate,
+    MeetingPointData, NoteCreate, NoteData, PlanConfigData, PlanData, Storage, TeamCreate,
+    TeamData, TeamMetaData, TeamStatus, TeamUpdate, MAX_COURSES_PER_PROJECT, MAX_PROJECTS_PER_USER,
+    MAX_TEAMS_PER_PROJECT,
 };
 
-const DATA_KEY: &str = "tcc_data";
+/// The schema changed with the new backend API, so the data lives under a new key
+/// (old data is neither read nor overwritten).
+const DATA_KEY: &str = "tcc_data_v2";
 
+/// Local storage holds exactly what the backend can hold, restricted to what makes sense without a
+/// server: no share configuration, no access tokens, no audit log, no participant self-service,
+/// no email notifications and no plan "stale" tracking.
 #[derive(PartialEq, Clone, Debug)]
 pub struct LocalStorage {
     storage: web_sys::Storage,
@@ -22,7 +29,6 @@ impl CourseCreate {
             id: course_id,
             name: self.name.clone(),
             time: self.time,
-            has_multiple_hosts: self.has_multiple_hosts,
         }
     }
 }
@@ -33,42 +39,29 @@ impl CourseUpdate {
             id: course_id,
             name: self.name.clone(),
             time: self.time,
-            has_multiple_hosts: self.has_multiple_hosts,
         }
     }
 }
 
 impl TeamCreate {
     pub fn to_local(&self, team_id: Uuid) -> TeamData {
+        let now = Utc::now().naive_utc();
         TeamData {
             id: team_id,
             name: self.name.clone(),
-            created: Utc::now().naive_utc(),
-            edited: Utc::now().naive_utc(),
+            created: now,
+            edited: now,
             address: self.address.clone(),
             mail: self.mail.clone(),
             phone: self.phone.clone(),
             members: self.members,
             diets: self.diets.clone(),
-            needs_check: self.needs_check,
-            note_list: vec![],
-        }
-    }
-}
-
-impl TeamUpdate {
-    pub fn to_local(&self, team_id: Uuid, created: NaiveDateTime) -> TeamData {
-        TeamData {
-            id: team_id,
-            name: self.name.clone(),
-            created,
-            edited: Utc::now().naive_utc(),
-            address: self.address.clone(),
-            mail: self.mail.clone(),
-            phone: self.phone.clone(),
-            members: self.members,
-            diets: self.diets.clone(),
-            needs_check: self.needs_check,
+            status: if self.needs_check {
+                TeamStatus::Review
+            } else {
+                TeamStatus::Active
+            },
+            cloud: None,
             note_list: vec![],
         }
     }
@@ -76,25 +69,20 @@ impl TeamUpdate {
 
 impl CookAndRunCreate {
     fn to_cook_and_run_data(&self, cook_and_run_id: Uuid) -> CookAndRunData {
-        CookAndRunData {
-            id: cook_and_run_id,
-            name: self.name.clone(),
-            created: Utc::now().naive_utc(),
-            edited: Utc::now().naive_utc(),
-            occur: Utc::now().naive_utc(),
-            is_in_cloud: false,
-            team_list: vec![],
-            course_list: vec![],
-            course_with_more_hosts: None,
-            start_point: None,
-            end_point: None,
-            top_plan: None,
-            plan_config: None,
-            plan_text: None,
-            invite_allowed: false,
-            invite_text: None,
-        }
+        // The admin notification email only matters for the backend and is not stored locally.
+        CookAndRunData::new(cook_and_run_id, self.name.clone())
     }
+}
+
+fn project_not_found(id: Uuid) -> String {
+    format!("Cook and run project with ID {} not found", id)
+}
+
+fn team_not_found(team_id: Uuid, cook_and_run_id: Uuid) -> String {
+    format!(
+        "Team with ID {} not found in Cook and Run project {}",
+        team_id, cook_and_run_id
+    )
 }
 
 impl LocalStorage {
@@ -131,134 +119,111 @@ impl LocalStorage {
             })?
             .unwrap_or_else(|| "[]".to_string());
 
-        let cook_and_run_data =
-            serde_json::from_str(&data).map_err(|e| format!("Data could not parse json: {}", e))?;
-
-        return Ok(cook_and_run_data);
+        serde_json::from_str(&data).map_err(|e| format!("Data could not parse json: {}", e))
     }
 
-    fn get_cook_and_run_data_by_id(&self, id: Uuid) -> Option<CookAndRunData> {
-        for data in &self.cook_and_run_data {
-            if data.id == id {
-                return Some(data.clone());
-            }
-        }
-        None
+    /// Cheap existence check (the storage manager uses it to decide between local and cloud).
+    pub fn contains(&self, id: Uuid) -> bool {
+        self.cook_and_run_data.iter().any(|data| data.id == id)
     }
 
-    fn update_cook_and_run_data(&mut self, cook_and_run: &CookAndRunData) -> Result<(), String> {
-        let mut found = false;
-        let mut new_data = self.cook_and_run_data.clone();
-        for data in &mut new_data {
-            if data.id == cook_and_run.id {
-                *data = cook_and_run.clone();
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return Err(format!(
-                "Cook and run project with ID {} not found",
-                cook_and_run.id
-            ));
-        }
-        let cook_and_run_data_string = serde_json::to_string(&new_data)
+    fn get(&self, id: Uuid) -> Result<&CookAndRunData, String> {
+        self.cook_and_run_data
+            .iter()
+            .find(|data| data.id == id)
+            .ok_or_else(|| project_not_found(id))
+    }
+
+    /// Writes the in-memory state to the browser storage.
+    fn persist(&self) -> Result<(), String> {
+        let json = serde_json::to_string(&self.cook_and_run_data)
             .map_err(|e| format!("Struct could not be parsed into json: {}", e))?;
 
-        self.storage
-            .set_item(DATA_KEY, &cook_and_run_data_string)
-            .map_err(|e| {
-                format!(
-                    "Data could not be stored: {}",
-                    e.as_string().unwrap_or_default()
-                )
-            })?;
-        self.cook_and_run_data = new_data;
-
-        Ok(())
+        self.storage.set_item(DATA_KEY, &json).map_err(|e| {
+            format!(
+                "Data could not be stored: {}",
+                e.as_string().unwrap_or_default()
+            )
+        })
     }
 
-    fn delete_cook_and_run_data(&mut self, cook_and_run_id: Uuid) -> Result<(), String> {
-        let mut new_data = self.cook_and_run_data.clone();
-        let original_len = new_data.len();
-        new_data.retain(|data| data.id != cook_and_run_id);
+    /// Applies `change` to a copy of the project, stamps `edited` and persists it. If the change or
+    /// the persisting fails the stored state stays untouched.
+    fn modify<F>(&mut self, id: Uuid, change: F) -> Result<(), String>
+    where
+        F: FnOnce(&mut CookAndRunData) -> Result<(), String>,
+    {
+        let index = self
+            .cook_and_run_data
+            .iter()
+            .position(|data| data.id == id)
+            .ok_or_else(|| project_not_found(id))?;
 
-        if new_data.len() == original_len {
-            return Err(format!(
-                "Cook and run project with ID {} not found",
-                cook_and_run_id
-            ));
+        let mut project = self.cook_and_run_data[index].clone();
+        change(&mut project)?;
+        project.edited = Utc::now().naive_utc();
+
+        let previous = std::mem::replace(&mut self.cook_and_run_data[index], project);
+        if let Err(e) = self.persist() {
+            self.cook_and_run_data[index] = previous;
+            return Err(e);
         }
-
-        let cook_and_run_data_string = serde_json::to_string(&new_data)
-            .map_err(|e| format!("Struct could not be parsed into json: {}", e))?;
-
-        self.storage
-            .set_item(DATA_KEY, &cook_and_run_data_string)
-            .map_err(|e| {
-                format!(
-                    "Data could not be stored: {}",
-                    e.as_string().unwrap_or_default()
-                )
-            })?;
-
-        self.cook_and_run_data = new_data;
-
         Ok(())
     }
 }
 
 impl Storage for LocalStorage {
+    // ----- project ---------------------------------------------------------------------------
+
     async fn create_cook_and_run(
         &mut self,
         cook_and_run_id: Uuid,
         cook_and_run: &CookAndRunCreate,
     ) -> Result<(), String> {
-        let mut new_data = self.cook_and_run_data.clone();
-        for data in &mut new_data {
-            if data.id == cook_and_run_id {
-                return Err(format!(
-                    "Cook and run project with ID {} already exists",
-                    cook_and_run_id
-                ));
-            }
+        cook_and_run.validate()?;
+        if self.contains(cook_and_run_id) {
+            return Err(format!(
+                "Cook and run project with ID {} already exists",
+                cook_and_run_id
+            ));
+        }
+        if self.cook_and_run_data.len() >= MAX_PROJECTS_PER_USER {
+            return Err(format!(
+                "Project limit of {} reached",
+                MAX_PROJECTS_PER_USER
+            ));
         }
 
-        new_data.push(cook_and_run.to_cook_and_run_data(cook_and_run_id));
-
-        let cook_and_run_data_string = serde_json::to_string(&new_data)
-            .map_err(|e| format!("Struct could not be parsed into json: {}", e))?;
-
-        self.storage
-            .set_item(DATA_KEY, &cook_and_run_data_string)
-            .map_err(|e| {
-                format!(
-                    "Data could not be stored: {}",
-                    e.as_string().unwrap_or_default()
-                )
-            })?;
-        self.cook_and_run_data = new_data;
-
+        self.cook_and_run_data
+            .push(cook_and_run.to_cook_and_run_data(cook_and_run_id));
+        if let Err(e) = self.persist() {
+            self.cook_and_run_data.pop();
+            return Err(e);
+        }
         Ok(())
     }
 
     async fn delete_cook_and_run(&mut self, id: Uuid) -> Result<(), String> {
-        self.delete_cook_and_run_data(id)
+        let index = self
+            .cook_and_run_data
+            .iter()
+            .position(|data| data.id == id)
+            .ok_or_else(|| project_not_found(id))?;
+
+        let removed = self.cook_and_run_data.remove(index);
+        if let Err(e) = self.persist() {
+            self.cook_and_run_data.insert(index, removed);
+            return Err(e);
+        }
+        Ok(())
     }
 
     async fn select_cook_and_run(&self, id: Uuid) -> Result<CookAndRunData, String> {
-        let result = self.get_cook_and_run_data_by_id(id);
-        match result {
-            Some(data) => Ok(data),
-            None => Err(format!("Cook and run project with ID {} not found", id)),
-        }
+        self.get(id).cloned()
     }
+
     async fn select_cook_and_run_meta(&self, id: Uuid) -> Result<CookAndRunMetaData, String> {
-        let result = self.get_cook_and_run_data_by_id(id);
-        match result {
-            Some(data) => Ok(data.to_meta()),
-            None => Err(format!("Cook and run project with ID {} not found", id)),
-        }
+        self.get(id).map(|data| data.to_meta())
     }
 
     async fn select_cook_and_run_meta_list(&self) -> Result<Vec<CookAndRunMetaData>, String> {
@@ -270,23 +235,68 @@ impl Storage for LocalStorage {
         cook_and_run_id: Uuid,
         cook_and_run_meta: &CookAndRunMetaUpdate,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-        update_meta(&mut cook_and_run, cook_and_run_id, cook_and_run_meta)?;
-        self.update_cook_and_run_data(&cook_and_run)
+        cook_and_run_meta.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            project.name = cook_and_run_meta.name.clone();
+            project.occur = cook_and_run_meta.occur;
+            Ok(())
+        })
     }
 
-    async fn update_plan_of_cook_and_run(
+    // ----- start / end point -----------------------------------------------------------------
+
+    async fn select_cook_and_run_start_point(
+        &self,
+        cook_and_run_id: Uuid,
+    ) -> Result<Option<MeetingPointData>, String> {
+        Ok(self.get(cook_and_run_id)?.start_point.clone())
+    }
+
+    async fn update_start_point_in_cook_and_run(
         &mut self,
         cook_and_run_id: Uuid,
-        plan: &PlanData,
+        start_point: &Option<MeetingPointData>,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-        cook_and_run.top_plan = Some(plan.clone());
-        self.update_cook_and_run_data(&cook_and_run)
+        if let Some(point) = start_point {
+            point.validate()?;
+        }
+        self.modify(cook_and_run_id, |project| {
+            project.start_point = start_point.clone();
+            Ok(())
+        })
+    }
+
+    async fn select_cook_and_run_end_point(
+        &self,
+        cook_and_run_id: Uuid,
+    ) -> Result<Option<MeetingPointData>, String> {
+        Ok(self.get(cook_and_run_id)?.end_point.clone())
+    }
+
+    async fn update_end_point_in_cook_and_run(
+        &mut self,
+        cook_and_run_id: Uuid,
+        end_point: &Option<MeetingPointData>,
+    ) -> Result<(), String> {
+        if let Some(point) = end_point {
+            point.validate()?;
+        }
+        self.modify(cook_and_run_id, |project| {
+            project.end_point = end_point.clone();
+            Ok(())
+        })
+    }
+
+    // ----- courses ---------------------------------------------------------------------------
+
+    async fn select_cook_and_run_course_list(
+        &self,
+        cook_and_run_id: Uuid,
+    ) -> Result<Vec<CourseData>, String> {
+        let mut courses = self.get(cook_and_run_id)?.course_list.clone();
+        // The backend returns courses ordered by time.
+        courses.sort_by_key(|course| course.time);
+        Ok(courses)
     }
 
     async fn create_course_of_cook_and_run(
@@ -295,19 +305,23 @@ impl Storage for LocalStorage {
         course_id: Uuid,
         course: &CourseCreate,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        if cook_and_run.course_list.iter().any(|c| c.id == course_id) {
-            return Err(format!(
-                "Course with ID {} already exists in Cook and Run project {}",
-                course_id, cook_and_run_id
-            ));
-        }
-
-        cook_and_run.course_list.push(course.to_local(course_id));
-        self.update_cook_and_run_data(&cook_and_run)
+        course.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            if project.course_list.len() >= MAX_COURSES_PER_PROJECT {
+                return Err(format!(
+                    "Course limit of {} reached for project {}",
+                    MAX_COURSES_PER_PROJECT, cook_and_run_id
+                ));
+            }
+            if project.course_list.iter().any(|c| c.id == course_id) {
+                return Err(format!(
+                    "Course with ID {} already exists in Cook and Run project {}",
+                    course_id, cook_and_run_id
+                ));
+            }
+            project.course_list.push(course.to_local(course_id));
+            Ok(())
+        })
     }
 
     async fn update_course_of_cook_and_run(
@@ -316,26 +330,21 @@ impl Storage for LocalStorage {
         course_id: Uuid,
         course: &CourseUpdate,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        let mut found = false;
-        for c in &mut cook_and_run.course_list {
-            if c.id == course_id {
-                *c = course.to_local(course_id);
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            return Err(format!(
-                "Course with ID {} not found in Cook and Run project {}",
-                course_id, cook_and_run_id
-            ));
-        }
-
-        self.update_cook_and_run_data(&cook_and_run)
+        course.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            let existing = project
+                .course_list
+                .iter_mut()
+                .find(|c| c.id == course_id)
+                .ok_or_else(|| {
+                    format!(
+                        "Course with ID {} not found in Cook and Run project {}",
+                        course_id, cook_and_run_id
+                    )
+                })?;
+            *existing = course.to_local(course_id);
+            Ok(())
+        })
     }
 
     async fn delete_course_of_cook_and_run(
@@ -343,41 +352,55 @@ impl Storage for LocalStorage {
         cook_and_run_id: Uuid,
         course_id: Uuid,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        let original_len = cook_and_run.course_list.len();
-        cook_and_run.course_list.retain(|c| c.id != course_id);
-
-        if cook_and_run.course_list.len() == original_len {
-            return Err(format!(
-                "Course with ID {} not found in Cook and Run project {}",
-                course_id, cook_and_run_id
-            ));
-        }
-
-        self.update_cook_and_run_data(&cook_and_run)
+        self.modify(cook_and_run_id, |project| {
+            let original_len = project.course_list.len();
+            project.course_list.retain(|c| c.id != course_id);
+            if project.course_list.len() == original_len {
+                return Err(format!(
+                    "Course with ID {} not found in Cook and Run project {}",
+                    course_id, cook_and_run_id
+                ));
+            }
+            // Keep the plan free of dangling references.
+            if let Some(plan) = project.top_plan.as_mut() {
+                *plan = plan.remap(|course| (course != course_id).then_some(course), Some);
+            }
+            Ok(())
+        })
     }
 
-    async fn update_course_with_more_hosts_of_cook_and_run(
-        &mut self,
+    // ----- teams -----------------------------------------------------------------------------
+
+    async fn select_cook_and_run_team_list(
+        &self,
         cook_and_run_id: Uuid,
-        course_id: Uuid,
-    ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
+    ) -> Result<Vec<TeamData>, String> {
+        Ok(self.get(cook_and_run_id)?.team_list.clone())
+    }
 
-        if !cook_and_run.course_list.iter().any(|c| c.id == course_id) {
-            return Err(format!(
-                "Course with ID {} not found in Cook and Run project {}",
-                course_id, cook_and_run_id
-            ));
-        }
+    async fn select_cook_and_run_team_meta_list(
+        &self,
+        cook_and_run_id: Uuid,
+    ) -> Result<Vec<TeamMetaData>, String> {
+        Ok(self
+            .get(cook_and_run_id)?
+            .team_list
+            .iter()
+            .map(|team| team.to_meta())
+            .collect())
+    }
 
-        cook_and_run.course_with_more_hosts = Some(course_id);
-        self.update_cook_and_run_data(&cook_and_run)
+    async fn select_cook_and_run_team(
+        &self,
+        cook_and_run_id: Uuid,
+        team_id: Uuid,
+    ) -> Result<TeamData, String> {
+        self.get(cook_and_run_id)?
+            .team_list
+            .iter()
+            .find(|team| team.id == team_id)
+            .cloned()
+            .ok_or_else(|| team_not_found(team_id, cook_and_run_id))
     }
 
     async fn create_team_of_cook_and_run(
@@ -386,19 +409,23 @@ impl Storage for LocalStorage {
         team_id: Uuid,
         team: &TeamCreate,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        if cook_and_run.team_list.iter().any(|t| t.id == team_id) {
-            return Err(format!(
-                "Team with ID {} already exists in Cook and Run project {}",
-                team_id, cook_and_run_id
-            ));
-        }
-        cook_and_run.edited = Utc::now().naive_utc();
-        cook_and_run.team_list.push(team.to_local(team_id));
-        self.update_cook_and_run_data(&cook_and_run)
+        team.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            if project.team_list.len() >= MAX_TEAMS_PER_PROJECT {
+                return Err(format!(
+                    "Maximum number of teams exceeded: {} for project {}",
+                    MAX_TEAMS_PER_PROJECT, cook_and_run_id
+                ));
+            }
+            if project.team_list.iter().any(|t| t.id == team_id) {
+                return Err(format!(
+                    "Team with ID {} already exists in Cook and Run project {}",
+                    team_id, cook_and_run_id
+                ));
+            }
+            project.team_list.push(team.to_local(team_id));
+            Ok(())
+        })
     }
 
     async fn update_team_of_cook_and_run(
@@ -407,26 +434,31 @@ impl Storage for LocalStorage {
         team_id: Uuid,
         team: &TeamUpdate,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        let mut found = false;
-        for t in &mut cook_and_run.team_list {
-            if t.id == team_id {
-                *t = team.to_local(team_id, t.created);
-                found = true;
-                break;
+        team.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            let existing = project
+                .team_list
+                .iter_mut()
+                .find(|t| t.id == team_id)
+                .ok_or_else(|| team_not_found(team_id, cook_and_run_id))?;
+            if existing.status == TeamStatus::Canceled {
+                return Err("Team is canceled and can no longer be edited".to_string());
             }
-        }
-        if !found {
-            return Err(format!(
-                "Team with ID {} not found in Cook and Run project {}",
-                team_id, cook_and_run_id
-            ));
-        }
-        cook_and_run.edited = Utc::now().naive_utc();
-        self.update_cook_and_run_data(&cook_and_run)
+            // Notes, creation date and id are kept, everything else is overwritten.
+            existing.name = team.name.clone();
+            existing.address = team.address.clone();
+            existing.mail = team.mail.clone();
+            existing.phone = team.phone.clone();
+            existing.members = team.members;
+            existing.diets = team.diets.clone();
+            existing.status = if team.needs_check {
+                TeamStatus::Review
+            } else {
+                TeamStatus::Active
+            };
+            existing.edited = Utc::now().naive_utc();
+            Ok(())
+        })
     }
 
     async fn delete_team_of_cook_and_run(
@@ -434,22 +466,34 @@ impl Storage for LocalStorage {
         cook_and_run_id: Uuid,
         team_id: Uuid,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
+        self.modify(cook_and_run_id, |project| {
+            let original_len = project.team_list.len();
+            project.team_list.retain(|t| t.id != team_id);
+            if project.team_list.len() == original_len {
+                return Err(team_not_found(team_id, cook_and_run_id));
+            }
+            // Keep the plan free of dangling references.
+            if let Some(plan) = project.top_plan.as_mut() {
+                *plan = plan.remap(Some, |team| (team != team_id).then_some(team));
+            }
+            Ok(())
+        })
+    }
 
-        let original_len = cook_and_run.team_list.len();
-        cook_and_run.team_list.retain(|t| t.id != team_id);
+    // ----- notes -----------------------------------------------------------------------------
 
-        if cook_and_run.team_list.len() == original_len {
-            return Err(format!(
-                "Team with ID {} not found in Cook and Run project {}",
-                team_id, cook_and_run_id
-            ));
-        }
-
-        cook_and_run.edited = Utc::now().naive_utc();
-        self.update_cook_and_run_data(&cook_and_run)
+    async fn select_team_note_list_of_cook_and_run(
+        &self,
+        cook_and_run_id: Uuid,
+        team_id: Uuid,
+    ) -> Result<Vec<NoteData>, String> {
+        let mut notes = self
+            .select_cook_and_run_team(cook_and_run_id, team_id)
+            .await?
+            .note_list;
+        // The backend returns notes ordered by creation time (oldest first).
+        notes.sort_by_key(|note| note.created);
+        Ok(notes)
     }
 
     async fn create_team_note_of_cook_and_run(
@@ -459,31 +503,23 @@ impl Storage for LocalStorage {
         note_id: Uuid,
         note_data: &NoteCreate,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
+        note_data.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            let team = project
+                .team_list
+                .iter_mut()
+                .find(|t| t.id == team_id)
+                .ok_or_else(|| team_not_found(team_id, cook_and_run_id))?;
 
-        let team = cook_and_run
-            .team_list
-            .iter_mut()
-            .find(|t| t.id == team_id)
-            .ok_or_else(|| {
-                format!(
-                    "Team with ID {} not found in Cook and Run project {}",
-                    team_id, cook_and_run_id
-                )
-            })?;
-
-        if team.note_list.iter().any(|n| n.id == note_id) {
-            return Err(format!(
-                "Note with ID {} already exists in Team {} of Cook and Run project {}",
-                note_id, team_id, cook_and_run_id
-            ));
-        }
-
-        team.note_list.push(note_data.to_note(note_id));
-        cook_and_run.edited = Utc::now().naive_utc();
-        self.update_cook_and_run_data(&cook_and_run)
+            if team.note_list.iter().any(|n| n.id == note_id) {
+                return Err(format!(
+                    "Note with ID {} already exists in Team {} of Cook and Run project {}",
+                    note_id, team_id, cook_and_run_id
+                ));
+            }
+            team.note_list.push(note_data.to_note(note_id));
+            Ok(())
+        })
     }
 
     async fn delete_team_note_of_cook_and_run(
@@ -492,209 +528,99 @@ impl Storage for LocalStorage {
         team_id: Uuid,
         note_id: Uuid,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
+        self.modify(cook_and_run_id, |project| {
+            let team = project
+                .team_list
+                .iter_mut()
+                .find(|t| t.id == team_id)
+                .ok_or_else(|| team_not_found(team_id, cook_and_run_id))?;
 
-        let team = cook_and_run
-            .team_list
-            .iter_mut()
-            .find(|t| t.id == team_id)
-            .ok_or_else(|| {
-                format!(
-                    "Team with ID {} not found in Cook and Run project {}",
-                    team_id, cook_and_run_id
-                )
-            })?;
-
-        let original_len = team.note_list.len();
-        team.note_list.retain(|n| n.id != note_id);
-
-        if team.note_list.len() == original_len {
-            return Err(format!(
-                "Note with ID {} not found in Team {} of Cook and Run project {}",
-                note_id, team_id, cook_and_run_id
-            ));
-        }
-
-        cook_and_run.edited = Utc::now().naive_utc();
-        self.update_cook_and_run_data(&cook_and_run)
-    }
-
-    async fn update_start_point_in_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-        start_point: &Option<MeetingPointData>,
-    ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        cook_and_run.start_point = start_point.clone();
-        cook_and_run.edited = Utc::now().naive_utc();
-        self.update_cook_and_run_data(&cook_and_run)
-    }
-
-    async fn update_end_point_in_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-        end_point: &Option<MeetingPointData>,
-    ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        cook_and_run.end_point = end_point.clone();
-        cook_and_run.edited = Utc::now().naive_utc();
-        self.update_cook_and_run_data(&cook_and_run)
-    }
-
-    async fn select_cook_and_run_team_list(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Vec<TeamData>, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        Ok(cook_and_run.team_list)
-    }
-
-    async fn select_cook_and_run_team(
-        &self,
-        cook_and_run_id: Uuid,
-        team_id: Uuid,
-    ) -> Result<TeamData, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        for team in cook_and_run.team_list {
-            if team.id == team_id {
-                return Ok(team);
+            let original_len = team.note_list.len();
+            team.note_list.retain(|n| n.id != note_id);
+            if team.note_list.len() == original_len {
+                return Err(format!(
+                    "Note with ID {} not found in Team {} of Cook and Run project {}",
+                    note_id, team_id, cook_and_run_id
+                ));
             }
-        }
-        Err("Team not found!".to_string())
+            Ok(())
+        })
     }
 
-    async fn select_cook_and_run_start_point(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Option<MeetingPointData>, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        Ok(cook_and_run.start_point)
-    }
-
-    async fn select_cook_and_run_end_point(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Option<MeetingPointData>, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        Ok(cook_and_run.end_point)
-    }
-
-    async fn select_cook_and_run_course_list(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Vec<CourseData>, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        Ok(cook_and_run.course_list)
-    }
-
-    async fn select_cook_and_run_share_config(
-        &self,
-        _: Uuid,
-    ) -> Result<Option<super::ShareTeamConfig>, String> {
-        Err("Local storage can't hold share config!".to_string())
-    }
-
-    async fn create_cook_and_run_share_config(
-        &mut self,
-        _: Uuid,
-        _: &super::ShareTeamConfigCreate,
-    ) -> Result<(), String> {
-        Err("Local storage can't hold share config!".to_string())
-    }
-
-    async fn update_cook_and_run_share_config(
-        &mut self,
-        _: Uuid,
-        _: &super::ShareTeamConfigCreate,
-    ) -> Result<(), String> {
-        Err("Local storage can't hold share config!".to_string())
-    }
+    // ----- plan ------------------------------------------------------------------------------
 
     async fn select_plan_of_cook_and_run(
         &self,
         cook_and_run_id: Uuid,
     ) -> Result<Option<PlanData>, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        Ok(cook_and_run.top_plan)
+        Ok(self.get(cook_and_run_id)?.top_plan.clone())
+    }
+
+    async fn update_plan_of_cook_and_run(
+        &mut self,
+        cook_and_run_id: Uuid,
+        plan: &PlanData,
+    ) -> Result<(), String> {
+        plan.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            let mut plan = plan.clone();
+            // Local plans are never "stale"; that marker is maintained by the backend only.
+            plan.stale_since = None;
+            project.top_plan = Some(plan);
+            Ok(())
+        })
     }
 
     async fn delete_plan_of_cook_and_run(&mut self, cook_and_run_id: Uuid) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        if cook_and_run.top_plan.is_none() {
-            return Err(format!(
-                "Plan not found in Cook and Run project with ID {}",
-                cook_and_run_id
-            ));
-        }
-
-        cook_and_run.top_plan = None;
-        self.update_cook_and_run_data(&cook_and_run)
+        self.modify(cook_and_run_id, |project| {
+            if project.top_plan.is_none() {
+                return Err(format!(
+                    "Plan not found in Cook and Run project with ID {}",
+                    cook_and_run_id
+                ));
+            }
+            project.top_plan = None;
+            Ok(())
+        })
     }
+
+    // ----- plan config -----------------------------------------------------------------------
 
     async fn select_plan_config_of_cook_and_run(
         &self,
         cook_and_run_id: Uuid,
-    ) -> Result<Option<super::PlanConfigData>, String> {
-        let cook_and_run = self.select_cook_and_run(cook_and_run_id).await?;
-        Ok(cook_and_run.plan_config)
+    ) -> Result<Option<PlanConfigData>, String> {
+        Ok(self.get(cook_and_run_id)?.plan_config.clone())
     }
 
     async fn update_plan_config_of_cook_and_run(
         &mut self,
         cook_and_run_id: Uuid,
-        plan_config: &super::PlanConfigData,
+        plan_config: &PlanConfigData,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        cook_and_run.plan_config = Some(plan_config.clone());
-        self.update_cook_and_run_data(&cook_and_run)
+        plan_config.validate()?;
+        self.modify(cook_and_run_id, |project| {
+            let mut plan_config = plan_config.clone();
+            // Access via link/account only exists for plans in the cloud.
+            plan_config.access.clear();
+            project.plan_config = Some(plan_config);
+            Ok(())
+        })
     }
 
     async fn delete_plan_config_of_cook_and_run(
         &mut self,
         cook_and_run_id: Uuid,
     ) -> Result<(), String> {
-        let mut cook_and_run = self
-            .get_cook_and_run_data_by_id(cook_and_run_id)
-            .ok_or_else(|| format!("Cook and run project with ID {} not found", cook_and_run_id))?;
-
-        if cook_and_run.plan_config.is_none() {
-            return Err(format!(
-                "Plan config not found in Cook and Run project with ID {}",
-                cook_and_run_id
-            ));
-        }
-
-        cook_and_run.plan_config = None;
-        self.update_cook_and_run_data(&cook_and_run)
+        self.modify(cook_and_run_id, |project| {
+            if project.plan_config.is_none() {
+                return Err(format!(
+                    "Plan config not found in Cook and Run project with ID {}",
+                    cook_and_run_id
+                ));
+            }
+            project.plan_config = None;
+            Ok(())
+        })
     }
-}
-fn update_meta(
-    cook_and_run: &mut CookAndRunData,
-    cook_and_run_id: Uuid,
-    cook_and_run_meta: &CookAndRunMetaUpdate,
-) -> Result<(), String> {
-    if cook_and_run.id != cook_and_run_id {
-        return Err(format!(
-            "CookAndRunMetaData ID does not match CookAndRunData ID: {} != {}",
-            cook_and_run.id, cook_and_run_id
-        ));
-    }
-    cook_and_run.name = cook_and_run_meta.name.clone();
-    cook_and_run.occur = cook_and_run_meta.occur.clone();
-    cook_and_run.edited = Utc::now().naive_utc();
-    Ok(())
 }

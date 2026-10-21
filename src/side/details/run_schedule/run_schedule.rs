@@ -1,20 +1,20 @@
 use chrono::NaiveDate;
 use dioxus::prelude::*;
-use pulldown_cmark::{html, Parser};
 
 use crate::{
-    side::{
-        details::run_schedule::{Course, MeetingPoint, Schedule, Team},
-        AddressSVG, PersonSVG, PhoneSVG, StartSVG, WarningSVG,
-    },
+    side::details::run_schedule::{markdown, Course, MeetingPoint, Schedule, Team},
     storage::{Language, PlanConfigData},
+    ui::{AddressSVG, PersonSVG, PhoneSVG, StartSVG, WarningSVG},
 };
+
+/// html-to-image 1.11.11 (MIT), served from our own assets: loading it from a CDN on every
+/// render meant running third-party code without any integrity check.
+const HTML_TO_IMAGE: Asset = asset!("/assets/html-to-image.js");
 
 enum TextModule {
     You,
     Guests,
     Timeline,
-    DietaryRestrictions,
 }
 
 impl TextModule {
@@ -26,8 +26,6 @@ impl TextModule {
             (TextModule::Guests, Language::German) => "Gäste",
             (TextModule::Timeline, Language::English) => "Timeline",
             (TextModule::Timeline, Language::German) => "Zeitplan",
-            (TextModule::DietaryRestrictions, Language::English) => "No restrictions",
-            (TextModule::DietaryRestrictions, Language::German) => "Keine Einschränkungen",
         }
     }
 }
@@ -85,25 +83,13 @@ pub async fn download(plan_title: String, team_name: String) {
 
 #[component]
 pub fn RunSchedule(plan_config: PlanConfigData, schedule: Schedule) -> Element {
-    let titel_html = {
-        let text = plan_config.title.as_str();
-        let parser = Parser::new(text);
-        let mut html_output = String::new();
-        html::push_html(&mut html_output, parser);
-        html_output
-    };
-
-    let description_html = {
-        let text = plan_config.description.as_str();
-        let parser = Parser::new(text);
-        let mut html_output = String::new();
-        html::push_html(&mut html_output, parser);
-        html_output
-    };
+    // Sanitized: title and description are user input rendered as HTML.
+    let titel_html = markdown::render(&plan_config.title);
+    let description_html = markdown::render(&plan_config.description);
 
     rsx!(
         document::Script {
-            src: "https://unpkg.com/html-to-image@1.11.11/dist/html-to-image.js"
+            src: HTML_TO_IMAGE
         }
         div {
             id: "section-to-print",
@@ -212,6 +198,7 @@ fn TimeLine(
                 }
                 for (i , (course , host)) in walking_path.iter().enumerate() {
                     TimeLineElement {
+                        key: "{course.time}-{course.name}",
                         is_up: i % 2 != 0,
                         course_name: course.name.clone(),
                         course_team_name: Some(host.name.clone()),
