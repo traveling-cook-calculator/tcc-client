@@ -110,11 +110,6 @@ fn InfoTab(cook_and_run_id: Uuid, config: ShareTeamConfig, team_count: usize) ->
 
     let max_reached = config.max_teams.is_some_and(|max| team_count >= max as usize);
     let allowed = config.max_teams.map(|max| max.to_string()).unwrap_or_else(|| "∞".to_string());
-    let tone = if max_reached {
-        "p-4 rounded-xl border border-red-200 bg-red-50"
-    } else {
-        "p-4 rounded-xl border border-amber-100 bg-amber-50/50"
-    };
     let dim = if max_reached { "opacity-50 pointer-events-none" } else { "" };
 
     let qr_download = qr.clone();
@@ -129,26 +124,24 @@ fn InfoTab(cook_and_run_id: Uuid, config: ShareTeamConfig, team_count: usize) ->
     rsx! {
         div { class: "space-y-4",
             div { class: "grid grid-cols-2 gap-4",
-                div { class: "{tone}",
-                    Eyebrow { text: "Teams Registered" }
+                Panel {
+                    Eyebrow { text: "Teams Registered", class: "block mb-1" }
                     p { class: "text-2xl font-bold text-brand-hover", "{team_count}" }
                 }
-                div { class: "{tone}",
-                    Eyebrow { text: "Teams Allowed" }
+                Panel {
+                    Eyebrow { text: "Teams Allowed", class: "block mb-1" }
                     p { class: "text-2xl font-bold text-brand-hover", "{allowed}" }
                 }
             }
 
             if max_reached {
-                div { class: "rounded-xl border border-amber-300 bg-amber-50 px-4 py-3",
-                    p { class: "text-sm font-semibold text-amber-700",
-                        "Maximum team limit reached – no more teams can join via the share link."
-                    }
+                Notice { tone: NoticeTone::Attention, roomy: true, title: "Maximum team limit reached",
+                    "No more teams can join via the share link."
                 }
             }
 
             div { class: "flex flex-col space-y-4 {dim}",
-                div { class: "flex flex-col items-center gap-3 p-4 rounded-xl border border-amber-100 bg-amber-50/30",
+                Panel { class: "flex flex-col items-center gap-3",
                     Eyebrow { text: "QR Code" }
                     if qr_uri.is_empty() {
                         p { class: "text-sm text-zinc-500", "The QR code could not be created." }
@@ -163,13 +156,6 @@ fn InfoTab(cook_and_run_id: Uuid, config: ShareTeamConfig, team_count: usize) ->
                 CopyField { label: "Share Link", value: share_url.clone() }
             }
         }
-    }
-}
-
-#[component]
-fn Eyebrow(#[props(into)] text: String) -> Element {
-    rsx! {
-        p { class: "text-[11px] font-semibold uppercase tracking-[0.12em] text-zinc-400 mb-1", "{text}" }
     }
 }
 
@@ -250,11 +236,11 @@ fn ConfigTab(
             }
 
             div { class: "grid grid-cols-1 sm:grid-cols-2 gap-3",
-                OptionBox { title: "Teams must confirm their email address",
+                OptionBox { title: "Teams should confirm their email address (teams without confirmation may not be admitted)",
                     Checkbox {
                         label: "Email verification",
                         checked: current.require_email_verification,
-                        onchange: move |checked| draft.write().require_email_verification = checked,
+                        onchange: move |checked| set_email_verification(&mut draft.write(), checked),
                     }
                 }
                 OptionBox { title: "New teams are reviewed before they take part",
@@ -266,16 +252,7 @@ fn ConfigTab(
                 }
             }
 
-            FieldGroup {
-                title: "Required Fields",
-                selected: current.required_fields.clone(),
-                onchange: move |fields| draft.write().required_fields = fields,
-            }
-            FieldGroup {
-                title: "Send team back to review when it changes",
-                selected: current.review_trigger_fields.clone(),
-                onchange: move |fields| draft.write().review_trigger_fields = fields,
-            }
+            FieldMatrix { draft }
 
             Field {
                 label: "Max Teams",
@@ -310,9 +287,7 @@ fn ConfigTab(
                 }
             }
             if deadline_passed {
-                div { class: "rounded-xl border border-amber-300 bg-amber-50 px-3 py-2",
-                    p { class: "text-xs font-semibold text-amber-700", "The registration deadline has passed." }
-                }
+                Notice { tone: NoticeTone::Attention, small: true, "The registration deadline has passed." }
             }
 
             OptionBox { title: "Receive an email when something happens",
@@ -352,43 +327,132 @@ fn ConfigTab(
 #[component]
 fn OptionBox(#[props(into)] title: String, children: Element) -> Element {
     rsx! {
-        div {
-            title: "{title}",
-            class: "px-3 py-2.5 rounded-xl border border-amber-100 bg-amber-50/30 hover:bg-amber-50/60 transition-colors",
-            {children}
+        Panel { flush: true, class: "px-3 py-2.5 hover:bg-amber-50/60 transition-colors",
+            div { title: "{title}", {children} }
         }
     }
 }
 
-/// A set of the four team fields (required fields / review triggers).
+/// The three questions the organiser answers per detail (name and address are always asked).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Setting {
+    /// Guests may enter it at all (it is shown to them).
+    Allowed,
+    /// Guests have to enter it.
+    Required,
+    /// Changing it sends the team back to review.
+    Review,
+}
+
+fn toggle(list: &mut Vec<RequiredField>, field: RequiredField, on: bool) {
+    list.retain(|f| *f != field);
+    if on {
+        list.push(field);
+    }
+}
+
+/// Changes one cell of the matrix and keeps the rows consistent, so the configuration is always
+/// one the server accepts: what is required or reviewed must be allowed, and a required
+/// confirmation of the address needs the address to be required.
+fn apply_setting(config: &mut ShareTeamConfigCreate, field: RequiredField, setting: Setting, on: bool) {
+    match setting {
+        Setting::Allowed => {
+            toggle(&mut config.allowed_fields, field, on);
+            if !on {
+                toggle(&mut config.required_fields, field, false);
+                toggle(&mut config.review_trigger_fields, field, false);
+                if field == RequiredField::Mail {
+                    config.require_email_verification = false;
+                }
+            }
+        }
+        Setting::Required => {
+            toggle(&mut config.required_fields, field, on);
+            if on {
+                toggle(&mut config.allowed_fields, field, true);
+            }
+            if !on && field == RequiredField::Mail {
+                config.require_email_verification = false;
+            }
+        }
+        Setting::Review => {
+            toggle(&mut config.review_trigger_fields, field, on);
+            if on {
+                toggle(&mut config.allowed_fields, field, true);
+            }
+        }
+    }
+}
+
+/// Turning the confirmation on makes the email address a required detail.
+fn set_email_verification(config: &mut ShareTeamConfigCreate, on: bool) {
+    config.require_email_verification = on;
+    if on {
+        apply_setting(config, RequiredField::Mail, Setting::Required, true);
+    }
+}
+
+/// Which details guests may enter, which they must, and which changes trigger a review.
 #[component]
-fn FieldGroup(
-    #[props(into)] title: String,
-    selected: Vec<RequiredField>,
-    onchange: EventHandler<Vec<RequiredField>>,
-) -> Element {
+fn FieldMatrix(draft: Signal<ShareTeamConfigCreate>) -> Element {
+    let current = draft.read().clone();
+    let columns = [
+        (Setting::Allowed, "May enter"),
+        (Setting::Required, "Required"),
+        (Setting::Review, "Review on change"),
+    ];
     rsx! {
-        div { class: "rounded-xl border border-amber-100 bg-amber-50/30 p-4",
-            Eyebrow { text: title }
-            div { class: "grid grid-cols-2 gap-2 mt-2",
-                for (field, label) in FIELD_OPTIONS {
-                    Checkbox {
-                        key: "{label}",
-                        label,
-                        checked: selected.contains(&field),
-                        onchange: {
-                            let selected = selected.clone();
-                            move |checked: bool| {
-                                let mut next: Vec<RequiredField> =
-                                    selected.iter().copied().filter(|f| *f != field).collect();
-                                if checked {
-                                    next.push(field);
-                                }
-                                onchange.call(next);
+        Panel { class: "space-y-3",
+            Eyebrow { text: "Team details" }
+            Hint {
+                "Name and address are always asked. For every other detail decide whether guests may enter it, whether they have to, and whether changing it sends the team back to review. A detail guests may not enter is neither shown nor stored."
+            }
+            div { class: "overflow-x-auto",
+                table { class: "w-full text-sm",
+                    caption { class: "sr-only", "Settings for the details of a team" }
+                    thead {
+                        tr { class: "text-left text-xs text-zinc-500",
+                            th { scope: "col", class: "py-1.5 pr-3 font-semibold", "Detail" }
+                            for (_, title) in columns {
+                                th { key: "{title}", scope: "col", class: "py-1.5 px-2 font-semibold text-center whitespace-nowrap", "{title}" }
                             }
-                        },
+                        }
+                    }
+                    tbody {
+                        for (field, label) in FIELD_OPTIONS {
+                            tr { key: "{label}", class: "border-t border-amber-100",
+                                th { scope: "row", class: "py-2 pr-3 text-left font-medium text-zinc-800", "{label}" }
+                                for (setting, title) in columns {
+                                    {
+                                        let allowed = current.allowed_fields.contains(&field);
+                                        let checked = match setting {
+                                            Setting::Allowed => allowed,
+                                            Setting::Required => current.required_fields.contains(&field),
+                                            Setting::Review => current.review_trigger_fields.contains(&field),
+                                        };
+                                        // The confirmation of the address needs the address as a required detail.
+                                        let forced = field == RequiredField::Mail
+                                            && current.require_email_verification
+                                            && matches!(setting, Setting::Allowed | Setting::Required);
+                                        rsx! {
+                                            td { key: "{title}", class: "py-2 px-2 text-center",
+                                                CheckboxCell {
+                                                    label: format!("{label}: {title}"),
+                                                    checked,
+                                                    disabled: forced,
+                                                    onchange: move |on| apply_setting(&mut draft.write(), field, setting, on),
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
+            }
+            if current.require_email_verification {
+                Hint { "The email address is required while the confirmation is switched on." }
             }
         }
     }
@@ -443,6 +507,74 @@ fn DeadlineField(
                     },
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(allowed: &[RequiredField], required: &[RequiredField], review: &[RequiredField]) -> ShareTeamConfigCreate {
+        ShareTeamConfigCreate {
+            allowed_fields: allowed.to_vec(),
+            required_fields: required.to_vec(),
+            review_trigger_fields: review.to_vec(),
+            invite_text: "x".into(),
+            ..ShareTeamConfigCreate::default()
+        }
+    }
+
+    #[test]
+    fn required_or_review_switches_the_detail_on() {
+        let mut c = config(&[], &[], &[]);
+        apply_setting(&mut c, RequiredField::Phone, Setting::Required, true);
+        apply_setting(&mut c, RequiredField::Diets, Setting::Review, true);
+        assert!(c.allowed_fields.contains(&RequiredField::Phone) && c.allowed_fields.contains(&RequiredField::Diets));
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn switching_a_detail_off_clears_its_other_settings() {
+        let all = RequiredField::ALL;
+        let mut c = config(&all, &[RequiredField::Phone], &[RequiredField::Phone]);
+        apply_setting(&mut c, RequiredField::Phone, Setting::Allowed, false);
+        assert!(!c.allowed_fields.contains(&RequiredField::Phone));
+        assert!(c.required_fields.is_empty() && c.review_trigger_fields.is_empty());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn the_confirmation_needs_the_address_and_every_path_keeps_that() {
+        let mut c = config(&[], &[], &[]);
+        set_email_verification(&mut c, true);
+        assert!(c.required_fields.contains(&RequiredField::Mail) && c.allowed_fields.contains(&RequiredField::Mail));
+        assert!(c.validate().is_ok());
+        // taking the address away takes the confirmation away
+        apply_setting(&mut c, RequiredField::Mail, Setting::Required, false);
+        assert!(!c.require_email_verification);
+        assert!(c.validate().is_ok());
+        set_email_verification(&mut c, true);
+        apply_setting(&mut c, RequiredField::Mail, Setting::Allowed, false);
+        assert!(!c.require_email_verification && c.required_fields.is_empty());
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn no_sequence_of_clicks_makes_an_invalid_configuration() {
+        let all = RequiredField::ALL;
+        let settings = [Setting::Allowed, Setting::Required, Setting::Review];
+        let mut c = config(&all, &[], &[]);
+        for step in 0..200usize {
+            let field = all[step % 4];
+            let setting = settings[(step / 4) % 3];
+            let on = (step / 12) % 2 == 0;
+            if step % 17 == 0 {
+                set_email_verification(&mut c, on);
+            } else {
+                apply_setting(&mut c, field, setting, on);
+            }
+            assert!(c.validate().is_ok(), "step {step}: {c:?}");
         }
     }
 }

@@ -1,10 +1,13 @@
 mod cloud;
+pub mod audit_text;
+pub mod design;
 mod local;
+pub mod local_designs;
 pub mod mapper;
 
 use std::{collections::HashMap, f64::consts::PI, hash::Hash};
 
-use chrono::{Duration, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use chrono::{Duration, NaiveDateTime, NaiveTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -12,7 +15,12 @@ use web_sys::console;
 
 use crate::{
     keycloak::AuthState,
-    storage::{cloud::CloudStorage, local::LocalStorage},
+    schedule_design::{DesignLibrary, ScheduleDesign},
+    storage::{
+        cloud::CloudStorage,
+        design::{CloudDesign, CloudLibrary, DesignError, DesignList, ImageMode},
+        local::LocalStorage,
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -27,12 +35,12 @@ pub const MIN_GUESTS_PER_HOSTING: usize = 1;
 pub const MAX_GUESTS_PER_HOSTING: usize = 5;
 
 const MAX_NAME_LEN: usize = 200;
-const MAX_ADDRESS_LEN: usize = 500;
+pub const MAX_ADDRESS_LEN: usize = 500;
 const MAX_PHONE_LEN: usize = 50;
 const MAX_DIETS_LEN: usize = 500;
-const MAX_MEMBERS: u16 = 10_000;
+/// The database column of the backend holds 0..=255.
+const MAX_MEMBERS: u16 = 255;
 const MAX_NOTE_CONTENT_LEN: usize = 50_000;
-const MAX_PLAN_DESCRIPTION_LEN: usize = 2_000;
 const MAX_INVITE_TEXT_LEN: usize = 5_000;
 const MAX_CANCEL_REASON_LEN: usize = 1_000;
 const MAX_SHARE_MAX_TEAMS: u32 = 128;
@@ -288,11 +296,6 @@ async fn fill_project<T: Storage>(
             .update_end_point_in_cook_and_run(id, &source.end_point)
             .await?;
     }
-    if let Some(plan_config) = &source.plan_config {
-        target
-            .update_plan_config_of_cook_and_run(id, plan_config)
-            .await?;
-    }
     // The plan goes last: saving it clears the stale marker that creating teams would set in the cloud.
     if let Some(plan) = &source.top_plan {
         let mut plan = plan.remap(
@@ -303,6 +306,59 @@ async fn fill_project<T: Storage>(
         target.update_plan_of_cook_and_run(id, &plan).await?;
     }
     Ok(())
+}
+
+/// Copies the designs of a local project into a new cloud project. The design that was open in the
+/// editor (the one used for the sheets) becomes the active one.
+async fn copy_designs_to_cloud(
+    cloud: &CloudStorage,
+    local_id: Uuid,
+    cloud_id: Uuid,
+) -> Result<(), String> {
+    let library = local_designs::load(local_id);
+    let mut active = None;
+    for (index, design) in library.designs.iter().enumerate() {
+        let design_id = Uuid::new_v4();
+        let mut design = design.clone();
+        cloud
+            .save_design(cloud_id, design_id, &mut design, None)
+            .await
+            .map_err(|e| format!("\"{}\": {}", design.name, e))?;
+        if index == library.active {
+            active = Some(design_id);
+        }
+    }
+    if active.is_some() {
+        cloud.set_active_design(cloud_id, active).await.map_err(String::from)?;
+    }
+    local_designs::remove(local_id);
+    Ok(())
+}
+
+/// Stores the designs of a cloud project in the browser storage under the id of the new local project.
+fn save_designs_locally(local_id: Uuid, cloud: CloudLibrary) -> Result<(), String> {
+    if cloud.designs.is_empty() {
+        return Ok(());
+    }
+    let active = cloud
+        .active
+        .and_then(|id| cloud.designs.iter().position(|design| design.id == id))
+        .unwrap_or(0);
+    let mut library = DesignLibrary {
+        designs: cloud
+            .designs
+            .into_iter()
+            .map(|CloudDesign { mut design, .. }| {
+                for image in &mut design.images {
+                    image.remote = None;
+                }
+                design
+            })
+            .collect(),
+        active,
+    };
+    library.sanitize();
+    local_designs::save(local_id, &library)
 }
 
 impl StorageManager {
@@ -344,6 +400,13 @@ impl StorageManager {
                 self.cloud = None;
                 Err(format!("Error while loading cloud connection: {}", e))
             }
+        }
+    }
+
+    /// Hands the cloud connection a renewed session. Cheap: no health check, no reload.
+    pub fn update_cloud_session(&mut self, auth_state: AuthState) {
+        if let Some(cloud) = self.cloud.as_mut() {
+            cloud.update_auth(auth_state);
         }
     }
 
@@ -399,6 +462,12 @@ impl StorageManager {
             .await
             .map_err(|e| format!("Error while loading cook and run from local storage: {}", e))?;
         let new_id = transfer(cloud, data, Some(admin_notification_email)).await?;
+        // The designs of the schedule sheets are not part of the project data: they move on their own.
+        if let Err(e) = copy_designs_to_cloud(cloud, cook_and_run_id, new_id).await {
+            return Err(format!(
+                "Uploaded as {new_id}, but the schedule designs could not be copied: {e}. The local copy was kept."
+            ));
+        }
         local
             .delete_cook_and_run(cook_and_run_id)
             .await
@@ -423,7 +492,17 @@ impl StorageManager {
             .select_cook_and_run(cook_and_run_id)
             .await
             .map_err(|e| format!("Error while loading cook and run from cloud: {}", e))?;
+        // Read the designs before the project is gone (pictures become data URLs of the browser).
+        let designs = cloud
+            .load_design_library(cook_and_run_id, ImageMode::Data)
+            .await
+            .map_err(|e| format!("Error while loading the schedule designs from the cloud: {}", e))?;
         let new_id = transfer(local, data, None).await?;
+        if let Err(e) = save_designs_locally(new_id, designs) {
+            return Err(format!(
+                "Downloaded as {new_id}, but the schedule designs could not be stored: {e}. The cloud copy was kept."
+            ));
+        }
         cloud
             .delete_cook_and_run(cook_and_run_id)
             .await
@@ -442,7 +521,8 @@ impl StorageManager {
 
     // ----- project -----------------------------------------------------------------------------
 
-    /// Projects are always created locally; use `upload_to_cloud` to move them to the cloud.
+    /// Creates the project in the local storage. Use `create_cook_and_run_in_cloud` to create it in the
+    /// cloud right away, or `upload_to_cloud` to move an existing local project there.
     pub async fn create_cook_and_run(
         &mut self,
         cook_and_run_id: Uuid,
@@ -453,8 +533,29 @@ impl StorageManager {
             .await
     }
 
+    /// Creates an empty project directly in the cloud (no local copy, no upload afterwards).
+    /// Needs a cloud connection and `admin_notification_email` in `cook_and_run`.
+    pub async fn create_cook_and_run_in_cloud(
+        &mut self,
+        cook_and_run_id: Uuid,
+        cook_and_run: &CookAndRunCreate,
+    ) -> Result<(), String> {
+        let cloud = self
+            .cloud
+            .as_mut()
+            .ok_or_else(|| "Cloud is not configured".to_string())?;
+        cloud
+            .create_cook_and_run(cook_and_run_id, cook_and_run)
+            .await
+    }
+
     pub async fn delete_cook_and_run(&mut self, cook_and_run_id: Uuid) -> Result<(), String> {
-        on_project_mut!(self, cook_and_run_id, delete_cook_and_run)
+        let was_local = self.local.contains(cook_and_run_id);
+        let result = on_project_mut!(self, cook_and_run_id, delete_cook_and_run);
+        if was_local && result.is_ok() {
+            local_designs::remove(cook_and_run_id);
+        }
+        result
     }
 
     pub async fn update_meta_of_cook_and_run(
@@ -748,31 +849,65 @@ impl StorageManager {
         on_project_mut!(self, cook_and_run_id, delete_plan_of_cook_and_run)
     }
 
-    pub async fn select_plan_config_of_cook_and_run(
+    // ----- schedule designs of cloud projects ---------------------------------------------------
+    //
+    // The designs of a local project are in the browser storage (`local_designs`), so these are
+    // only called for projects with `is_in_cloud`.
+
+    pub async fn select_designs(&self, cook_and_run_id: Uuid) -> Result<DesignList, DesignError> {
+        self.cloud()?.select_designs(cook_and_run_id).await
+    }
+
+    /// Every design of the project with its pictures (`blob:` URLs) and the active one.
+    pub async fn load_design_library(&self, cook_and_run_id: Uuid) -> Result<CloudLibrary, DesignError> {
+        self.cloud()?.load_design_library(cook_and_run_id, ImageMode::Blob).await
+    }
+
+    /// One design with its pictures, read fresh (after a conflict, or to get its `ETag`).
+    pub async fn load_design(
         &self,
         cook_and_run_id: Uuid,
-    ) -> Result<Option<PlanConfigData>, String> {
-        on_project!(self, cook_and_run_id, select_plan_config_of_cook_and_run)
+        design_id: Uuid,
+    ) -> Result<(CloudDesign, usize), DesignError> {
+        self.cloud()?.load_design(cook_and_run_id, design_id, ImageMode::Blob).await
     }
 
-    pub async fn update_plan_config_of_cook_and_run(
-        &mut self,
+    /// Saves a design (pictures first). `etag` `None` creates it. Returns the new `ETag`.
+    pub async fn save_design(
+        &self,
         cook_and_run_id: Uuid,
-        plan_config: &PlanConfigData,
-    ) -> Result<(), String> {
-        on_project_mut!(
-            self,
-            cook_and_run_id,
-            update_plan_config_of_cook_and_run,
-            plan_config
-        )
+        design_id: Uuid,
+        design: &mut ScheduleDesign,
+        etag: Option<&str>,
+    ) -> Result<String, DesignError> {
+        self.cloud()?.save_design(cook_and_run_id, design_id, design, etag).await
     }
 
-    pub async fn delete_plan_config_of_cook_and_run(
-        &mut self,
+    pub async fn delete_design(&self, cook_and_run_id: Uuid, design_id: Uuid) -> Result<(), DesignError> {
+        self.cloud()?.delete_design(cook_and_run_id, design_id).await
+    }
+
+    pub async fn set_active_design(
+        &self,
         cook_and_run_id: Uuid,
-    ) -> Result<(), String> {
-        on_project_mut!(self, cook_and_run_id, delete_plan_config_of_cook_and_run)
+        design_id: Option<Uuid>,
+    ) -> Result<(), DesignError> {
+        self.cloud()?.set_active_design(cook_and_run_id, design_id).await
+    }
+
+    /// The design the teams see (`None` if none is active), for the owner's view of a sheet.
+    pub async fn load_active_design(&self, cook_and_run_id: Uuid) -> Result<Option<ScheduleDesign>, DesignError> {
+        self.cloud()?.load_active_design(cook_and_run_id).await
+    }
+
+    /// The design a team sees. `Err` with `DesignErrorKind::TeamCanceled` if the team canceled.
+    pub async fn load_team_design(
+        &self,
+        cook_and_run_id: Uuid,
+        team_id: Uuid,
+        access: &TeamAccess,
+    ) -> Result<Option<ScheduleDesign>, DesignError> {
+        self.cloud()?.load_team_design(cook_and_run_id, team_id, access).await
     }
 
     // =========================================================================================
@@ -827,12 +962,24 @@ impl StorageManager {
             .await
     }
 
+    /// Organizer only (login required). The share-link pages use
+    /// [`Self::select_public_share_config`].
     pub async fn select_cook_and_run_share_config(
         &self,
         cook_and_run_id: Uuid,
     ) -> Result<Option<ShareTeamConfig>, String> {
         self.cloud()?
             .select_cook_and_run_share_config(cook_and_run_id)
+            .await
+    }
+
+    /// The configuration for guests (registration page, team page): no login needed.
+    pub async fn select_public_share_config(
+        &self,
+        cook_and_run_id: Uuid,
+    ) -> Result<Option<ShareTeamConfig>, String> {
+        self.cloud()?
+            .select_public_share_config(cook_and_run_id)
             .await
     }
 
@@ -916,14 +1063,16 @@ impl StorageManager {
             .await
     }
 
+    /// Confirms the mail address. `secret` is the part of the mail link that exists nowhere else.
     pub async fn verify_team_email(
         &self,
         cook_and_run_id: Uuid,
         team_id: Uuid,
         access_token: Uuid,
+        secret: Uuid,
     ) -> Result<(), String> {
         self.cloud()?
-            .verify_team_email(cook_and_run_id, team_id, access_token)
+            .verify_team_email(cook_and_run_id, team_id, access_token, secret)
             .await
     }
 
@@ -937,6 +1086,27 @@ impl StorageManager {
         self.cloud()?
             .cancel_team(cook_and_run_id, team_id, access_token, reason)
             .await
+    }
+
+    pub async fn export_team(
+        &self,
+        cook_and_run_id: Uuid,
+        team_id: Uuid,
+        access_token: Uuid,
+    ) -> Result<String, String> {
+        self.cloud()?
+            .export_team(cook_and_run_id, team_id, access_token)
+            .await
+    }
+
+    /// JSON document with everything the API stores about the logged in user.
+    pub async fn export_account_data(&self) -> Result<String, String> {
+        self.cloud()?.export_account_data().await
+    }
+
+    /// Deletes all cloud projects of the logged in user; returns how many were deleted.
+    pub async fn erase_account_data(&self) -> Result<u64, String> {
+        self.cloud()?.erase_account_data().await
     }
 
     pub async fn resend_team_verification(
@@ -1091,20 +1261,6 @@ pub trait Storage {
     ) -> Result<(), String>;
     async fn delete_plan_of_cook_and_run(&mut self, cook_and_run_id: Uuid) -> Result<(), String>;
 
-    // plan config
-    async fn select_plan_config_of_cook_and_run(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Option<PlanConfigData>, String>;
-    async fn update_plan_config_of_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-        plan_config: &PlanConfigData,
-    ) -> Result<(), String>;
-    async fn delete_plan_config_of_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-    ) -> Result<(), String>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1229,53 +1385,6 @@ impl PlanData {
         PlanData {
             hosting_list,
             stale_since: self.stale_since,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum PlanAccess {
-    Link,
-    Account,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlanConfigData {
-    /// Cloud only (who may open the plan). Always empty for local projects.
-    #[serde(default)]
-    pub access: Vec<PlanAccess>,
-    pub title: String,
-    pub description: String,
-    pub date: NaiveDate,
-    pub language: Language,
-}
-
-impl PlanConfigData {
-    pub fn validate(&self) -> Result<(), String> {
-        check_text("Plan title", &self.title, 1, MAX_NAME_LEN)?;
-        check_text(
-            "Plan description",
-            &self.description,
-            0,
-            MAX_PLAN_DESCRIPTION_LEN,
-        )?;
-        if self.access.len() > 2 {
-            return Err("Plan access must not contain more than 2 entries".to_string());
-        }
-        Ok(())
-    }
-}
-
-impl Default for PlanConfigData {
-    fn default() -> Self {
-        Self {
-            access: vec![],
-            title: "Plan".to_string(),
-            description: "<center>This is the plan for the cook and run event.</center>"
-                .to_string(),
-            date: Utc::now().naive_utc().date(),
-            language: Language::English,
         }
     }
 }
@@ -1411,6 +1520,14 @@ impl AddressData {
     }
 }
 
+impl AddressData {
+    /// An address nobody has entered yet: no text, no coordinates. (`default()` holds a
+    /// placeholder text for demo data, which a form would take for an entered address.)
+    pub fn empty() -> Self {
+        Self { address: String::new(), latitude: 0.0, longitude: 0.0 }
+    }
+}
+
 impl Default for AddressData {
     fn default() -> Self {
         Self {
@@ -1461,6 +1578,9 @@ pub struct TeamCloudData {
     pub cancel_reason: Option<String>,
     pub email_verified_at: Option<NaiveDateTime>,
     pub last_route_hash: Option<String>,
+    /// How often the team may still ask for the invitation mail (a team's own view only).
+    #[serde(default)]
+    pub verification_resends_left: Option<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Eq, Hash)]
@@ -1611,6 +1731,8 @@ pub struct TeamRegistration {
     pub members: Option<u16>,
     pub diets: Option<String>,
     pub access_token: Uuid,
+    /// Content of the invisible bot trap of the registration form. `None` for people.
+    pub honeypot: Option<String>,
 }
 
 impl TeamRegistration {
@@ -1692,8 +1814,6 @@ pub struct CookAndRunData {
     pub end_point: Option<MeetingPointData>,
     #[serde(default)]
     pub top_plan: Option<PlanData>,
-    #[serde(default)]
-    pub plan_config: Option<PlanConfigData>,
 }
 
 impl CookAndRunData {
@@ -1712,7 +1832,6 @@ impl CookAndRunData {
             start_point: None,
             end_point: None,
             top_plan: None,
-            plan_config: None,
         }
     }
 
@@ -1876,25 +1995,54 @@ impl TeamSort {
 // Audit log (cloud only)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+/// Who made the change. A value this client does not know is kept as it came.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
 pub enum AuditActorType {
+    /// The organizer (JWT).
     Admin,
+    /// A team, through its link or token.
     Participant,
-    #[serde(other)]
-    Unknown,
+    Other(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
+impl From<String> for AuditActorType {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "admin" => AuditActorType::Admin,
+            "participant" => AuditActorType::Participant,
+            _ => AuditActorType::Other(value),
+        }
+    }
+}
+
+/// What was done. A value this client does not know is kept as it came.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(from = "String")]
 pub enum AuditAction {
     Created,
     Updated,
     Canceled,
+    /// Does not occur at the moment.
     PlanInvalidated,
     ResendVerificationMail,
-    #[serde(other)]
-    Unknown,
+    /// The team confirmed its mail address with the link from the invitation mail.
+    EmailVerified,
+    Other(String),
+}
+
+impl From<String> for AuditAction {
+    fn from(value: String) -> Self {
+        match value.as_str() {
+            "created" => AuditAction::Created,
+            "updated" => AuditAction::Updated,
+            "canceled" => AuditAction::Canceled,
+            "plan_invalidated" => AuditAction::PlanInvalidated,
+            "resend_verification_mail" => AuditAction::ResendVerificationMail,
+            "email_verified" => AuditAction::EmailVerified,
+            _ => AuditAction::Other(value),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1929,11 +2077,26 @@ pub enum RequiredField {
     Diets,
 }
 
+impl RequiredField {
+    /// Every detail a guest can be asked for besides name and address.
+    pub const ALL: [RequiredField; 4] = [
+        RequiredField::Mail,
+        RequiredField::Phone,
+        RequiredField::Members,
+        RequiredField::Diets,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct ShareTeamConfig {
     pub invite_text: String,
     pub require_email_verification: bool,
     pub default_needs_check: bool,
+    /// What a guest may enter at all (a), what has to be entered (b: `required_fields`, a subset
+    /// of this) and what puts a changed team into review (c: `review_trigger_fields`, also a
+    /// subset). Name and address are always asked.
+    #[serde(default = "all_fields")]
+    pub allowed_fields: Vec<RequiredField>,
     pub required_fields: Vec<RequiredField>,
     pub max_teams: Option<u32>,
     pub registration_deadline: Option<NaiveDateTime>,
@@ -1943,14 +2106,65 @@ pub struct ShareTeamConfig {
     pub notify_admin_on_create: bool,
     pub notify_admin_on_cancel: bool,
     pub created: NaiveDateTime,
+    /// Only in the public configuration (guest pages): `max_teams` is reached, so nobody can
+    /// register any more (canceled teams do not count). The number of registrations stays
+    /// private.
+    #[serde(default)]
+    pub registration_full: bool,
+    /// Only in the public configuration: the organiser has chosen a design, so teams may see
+    /// their plan. Without it there is no plan to show.
+    #[serde(default)]
+    pub plan_published: bool,
+}
+
+fn all_fields() -> Vec<RequiredField> {
+    RequiredField::ALL.to_vec()
 }
 
 impl ShareTeamConfig {
+    /// A guest may enter / see this detail.
+    pub fn allows(&self, field: RequiredField) -> bool {
+        self.allowed_fields.contains(&field)
+    }
+
+    /// A guest has to enter this detail.
+    pub fn requires(&self, field: RequiredField) -> bool {
+        self.allows(field) && self.required_fields.contains(&field)
+    }
+
+    /// Changing this detail puts the team into review.
+    pub fn triggers_review(&self, field: RequiredField) -> bool {
+        self.allows(field) && self.review_trigger_fields.contains(&field)
+    }
+
+    /// The required details that are still empty. A form checks this before it sends anything,
+    /// so a request that the server would reject for missing data is never made.
+    pub fn missing_fields(
+        &self,
+        mail: &Option<String>,
+        phone: &Option<String>,
+        members: &Option<u16>,
+        diets: &Option<String>,
+    ) -> Vec<RequiredField> {
+        let blank = |value: &Option<String>| value.as_deref().is_none_or(|v| v.trim().is_empty());
+        RequiredField::ALL
+            .into_iter()
+            .filter(|field| self.requires(*field))
+            .filter(|field| match field {
+                RequiredField::Mail => blank(mail),
+                RequiredField::Phone => blank(phone),
+                RequiredField::Members => members.is_none_or(|m| m == 0),
+                RequiredField::Diets => blank(diets),
+            })
+            .collect()
+    }
+
     pub fn to_create(&self) -> ShareTeamConfigCreate {
         ShareTeamConfigCreate {
             invite_text: self.invite_text.clone(),
             require_email_verification: self.require_email_verification,
             default_needs_check: self.default_needs_check,
+            allowed_fields: self.allowed_fields.clone(),
             required_fields: self.required_fields.clone(),
             max_teams: self.max_teams,
             registration_deadline: self.registration_deadline,
@@ -1970,6 +2184,7 @@ impl Default for ShareTeamConfig {
             invite_text: defaults.invite_text,
             require_email_verification: defaults.require_email_verification,
             default_needs_check: defaults.default_needs_check,
+            allowed_fields: defaults.allowed_fields,
             required_fields: defaults.required_fields,
             max_teams: defaults.max_teams,
             registration_deadline: defaults.registration_deadline,
@@ -1979,6 +2194,8 @@ impl Default for ShareTeamConfig {
             notify_admin_on_create: defaults.notify_admin_on_create,
             notify_admin_on_cancel: defaults.notify_admin_on_cancel,
             created: Utc::now().naive_utc(),
+            registration_full: false,
+            plan_published: false,
         }
     }
 }
@@ -1988,6 +2205,7 @@ pub struct ShareTeamConfigCreate {
     pub invite_text: String,
     pub require_email_verification: bool,
     pub default_needs_check: bool,
+    pub allowed_fields: Vec<RequiredField>,
     pub required_fields: Vec<RequiredField>,
     pub max_teams: Option<u32>,
     pub registration_deadline: Option<NaiveDateTime>,
@@ -2015,6 +2233,17 @@ impl ShareTeamConfigCreate {
         if self.review_trigger_fields.len() > 4 {
             return Err("Review trigger fields must not contain more than 4 entries".to_string());
         }
+        // The same rules as the server: what is required or triggers a review must be allowed,
+        // and a confirmed mail address needs a mail address.
+        if self.required_fields.iter().any(|f| !self.allowed_fields.contains(f)) {
+            return Err("Required details must be among the allowed details".to_string());
+        }
+        if self.review_trigger_fields.iter().any(|f| !self.allowed_fields.contains(f)) {
+            return Err("Details that trigger a review must be among the allowed details".to_string());
+        }
+        if self.require_email_verification && !self.required_fields.contains(&RequiredField::Mail) {
+            return Err("A confirmed email address needs the email address to be required".to_string());
+        }
         Ok(())
     }
 }
@@ -2025,7 +2254,9 @@ impl Default for ShareTeamConfigCreate {
             invite_text: "".to_string(),
             require_email_verification: false,
             default_needs_check: true,
-            required_fields: vec![RequiredField::Mail, RequiredField::Diets],
+            allowed_fields: RequiredField::ALL.to_vec(),
+            // Only the email address is a must by default; dietary information is optional.
+            required_fields: vec![RequiredField::Mail],
             max_teams: None,
             registration_deadline: Utc::now()
                 .naive_utc()

@@ -3,7 +3,9 @@
 use chrono::NaiveDateTime;
 use dioxus::prelude::*;
 
-use super::lang::Lang;
+use super::lang::{with_days, Lang};
+use crate::config::Config;
+use crate::Route;
 use crate::ui::*;
 
 #[component]
@@ -66,30 +68,85 @@ pub fn ClosedView(lang: Lang, deadline: NaiveDateTime) -> Element {
     }
 }
 
+/// Registration is over because `max_teams` is reached.
 #[component]
-pub fn SuccessView(lang: Lang, verify_email: bool, in_review: bool) -> Element {
+pub fn FullView(lang: Lang) -> Element {
+    let t = lang.txt();
+    rsx! {
+        EmptyState {
+            title: t.full_title,
+            text: t.full_body,
+            icon: rsx! { LockSVG {} },
+        }
+    }
+}
+
+/// After the registration: what happens next, and the personal link of the team. The link is
+/// shown in every case; without an email address it is the only way back to the team.
+#[component]
+pub fn SuccessView(lang: Lang, verify_email: bool, in_review: bool, has_mail: bool, team_link: String) -> Element {
     let t = lang.txt();
     rsx! {
         Card { title: t.success_title, tone: Tone::Success, class: "max-sm:rounded-none max-sm:border-x-0",
-            div { class: "flex flex-col items-center gap-4 text-center py-6",
-                div { class: "w-16 h-16 rounded-full bg-green-100 flex items-center justify-center",
+            div { class: "flex flex-col items-center gap-3 text-center py-4",
+                div { class: "w-14 h-14 rounded-full bg-green-100 flex items-center justify-center",
                     svg {
-                        class: "w-8 h-8 text-green-600",
+                        class: "w-7 h-7 text-green-600",
                         view_box: "0 0 24 24",
                         fill: "none",
                         stroke: "currentColor",
                         stroke_width: "2.5",
+                        "aria-hidden": "true",
                         polyline { points: "20 6 9 17 4 12" }
                     }
                 }
-                p { class: "text-sm text-zinc-500 max-w-xs leading-relaxed", "{t.success_body}" }
+                p { class: "text-sm text-zinc-600 max-w-sm leading-relaxed", "{t.success_body}" }
                 if verify_email {
-                    p { class: "text-sm text-zinc-600 max-w-xs leading-relaxed", "{t.success_verify}" }
+                    p { class: "text-sm text-zinc-700 max-w-sm leading-relaxed font-medium", "{t.success_verify}" }
                 }
                 if in_review {
-                    p { class: "text-sm text-zinc-600 max-w-xs leading-relaxed", "{t.success_review}" }
+                    p { class: "text-sm text-zinc-600 max-w-sm leading-relaxed", "{t.success_review}" }
                 }
             }
+
+            Notice { tone: NoticeTone::Attention, roomy: true, class: "space-y-3", title: t.success_link_title,
+                if has_mail {
+                    p { "{t.success_link_mail}" }
+                } else {
+                    p { class: "font-semibold text-red-700", "{t.success_link_nomail}" }
+                }
+                CopyField {
+                    label: t.lbl_your_link,
+                    value: team_link.clone(),
+                    button_label: t.btn_copy,
+                    copied_label: t.copied,
+                    failed_label: t.copy_failed_title,
+                }
+                p { class: "text-xs text-zinc-600 leading-relaxed", "{t.link_secret_note}" }
+                a { href: "{team_link}", class: button_class(ButtonVariant::Primary), "{t.btn_open_team}" }
+            }
+        }
+    }
+}
+
+/// Information duty at the point of collection (Art. 13 GDPR): purpose, recipients, deletion,
+/// rights. The deletion period comes from the configuration (the API alone decides about it; a
+/// missing value just leaves the sentence out).
+#[component]
+pub fn PrivacyNotice(lang: Lang) -> Element {
+    let t = lang.txt();
+    let config = use_context::<Signal<Option<Config>>>();
+    let days = config.read().as_ref().and_then(|config| config.legal.retention_participant_data_days);
+
+    rsx! {
+        Notice { tone: NoticeTone::Attention, small: true, roomy: true, class: "space-y-1.5", title: t.privacy_title,
+            p { class: "text-xs text-zinc-700 leading-relaxed", "{t.privacy_intro}" }
+            if let Some(days) = days {
+                p { class: "text-xs text-zinc-700 leading-relaxed", "{with_days(t.privacy_retention_participants, days)}" }
+            }
+            p { class: "text-xs text-zinc-700 leading-relaxed", "{t.privacy_rights}" }
+            p { class: "text-xs text-zinc-700 leading-relaxed", "{t.privacy_minors}" }
+            Link { to: Route::Privacy {}, class: "text-xs font-medium text-amber-700 underline", "{t.privacy_link}" }
         }
     }
 }

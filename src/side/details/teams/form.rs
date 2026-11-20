@@ -17,10 +17,11 @@ pub fn TeamFields(
     let current = draft.read().clone();
     let errors = current.errors();
     let name_error = if current.name.is_empty() && !show_all_errors { String::new() } else { errors.name };
-    let dim = if disabled { "pointer-events-none opacity-60" } else { "" };
+    // Everything is greyed out, not only the address: a canceled team can not be edited.
+    let dim = if disabled { "pointer-events-none select-none opacity-60" } else { "" };
 
     rsx! {
-        div { class: "flex flex-col md:flex-row gap-6",
+        div { class: "flex flex-col md:flex-row gap-6 {dim}", "aria-disabled": disabled,
             div { class: "flex-1 space-y-4 md:border-r border-amber-100 md:pr-5",
                 Field { label: "Team Name", error: name_error.clone(),
                     TextInput {
@@ -73,7 +74,7 @@ pub fn TeamFields(
             }
 
             // `Address` renders its own heading.
-            div { class: "flex-1 {dim}", Address { param: address } }
+            div { class: "flex-1", Address { param: address } }
         }
     }
 }

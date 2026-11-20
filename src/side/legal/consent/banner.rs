@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use crate::ui::{Button, ButtonVariant};
 
 use crate::{config::Config, state::ConsentState, Route};
 
@@ -76,34 +77,21 @@ pub fn CookieBanner() -> Element {
                     // ── Trennlinie ───────────────────────────────────────
                     span { class: "h-5 w-px bg-amber-200/80 hidden sm:block" }
 
-                    // Nur Notwendige (gleichwertig prominent – DSGVO-Anforderung)
-                    button {
-                        class: "px-4 py-2 rounded-xl text-sm font-medium \
-                                bg-zinc-100 text-zinc-700 \
-                                hover:bg-zinc-200 \
-                                transition-colors duration-150 cursor-pointer",
+                    // Both answers are equally easy to give (GDPR): same size, same place, one click.
+                    Button {
+                        label: "Nur Notwendige",
+                        variant: ButtonVariant::Secondary,
                         onclick: {
                             let v = version.clone();
-                            move |_| {
-                                consent.set(ConsentState::accept_necessary(&v));
-                            }
+                            move |_| consent.set(ConsentState::accept_necessary(&v))
                         },
-                        "Nur Notwendige"
                     }
-
-                    // Akzeptieren
-                    button {
-                        class: "px-4 py-2 rounded-xl text-sm font-medium \
-                                bg-brand text-white \
-                                hover:bg-brand-hover \
-                                transition-colors duration-150 cursor-pointer",
+                    Button {
+                        label: "Akzeptieren",
                         onclick: {
                             let v = version.clone();
-                            move |_| {
-                                consent.set(ConsentState::accept_all(&v));
-                            }
+                            move |_| consent.set(ConsentState::accept_all(&v))
                         },
-                        "Akzeptieren"
                     }
                 }
             }

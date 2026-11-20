@@ -1,0 +1,54 @@
+# Rendered by the nginx image at container start (envsubst; only the variables API_ORIGIN,
+# AUTH_ORIGIN and CSP_MODE are substituted, nginx's own $variables stay as they are).
+
+server {
+    listen 8080;
+    server_name _;
+    server_tokens off;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_min_length 1024;
+    gzip_types application/wasm application/javascript text/css application/json image/svg+xml;
+
+    # ── Security headers ───────────────────────────────────────────
+    # Do not use `add_header` inside a location: it would drop the headers set here.
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    # The team token is part of the URL fragment (never sent), the path holds ids only.
+    add_header Referrer-Policy "no-referrer" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+    # CSP_MODE = Content-Security-Policy (enforce) or Content-Security-Policy-Report-Only (only
+    # report to the browser console). WebAssembly needs 'wasm-unsafe-eval'. The bootstrap script
+    # of the Dioxus bundle is inline, hence 'unsafe-inline' for scripts until the bundle in use
+    # was checked (see the comment in tests/infra/README.md).
+    add_header ${CSP_MODE} "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: ${API_ORIGIN}; font-src 'self' data:; connect-src 'self' ${API_ORIGIN} ${AUTH_ORIGIN}; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; object-src 'none'" always;
+
+    # ── Runtime configuration: never cached, never replaced by the SPA fallback ──
+    location = /config.json {
+        expires -1;
+        try_files $uri =404;
+    }
+
+    # Liveness/readiness of the container (Kubernetes probes).
+    location = /healthz {
+        access_log off;
+        default_type text/plain;
+        return 200 "ok\n";
+    }
+
+    # Files with a content hash in the name (assets/…-dxh<hash>.*) never change.
+    location /assets/ {
+        expires 1y;
+        try_files $uri =404;
+    }
+
+    # Single page application: every other address is handled by the router in the browser,
+    # e.g. /project/<id>/team/<id> from the mails.
+    location / {
+        expires -1;
+        try_files $uri /index.html;
+    }
+}

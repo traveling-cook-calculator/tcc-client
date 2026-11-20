@@ -110,7 +110,7 @@ pub fn TeamNotes(cook_and_run_id: Uuid, team_id: Uuid, notes: Vec<NoteData>) -> 
 #[component]
 fn NoteCard(note: NoteData) -> Element {
     rsx! {
-        div { class: "bg-amber-50/50 rounded-xl border border-amber-100 px-4 py-3",
+        Panel { flush: true, class: "px-4 py-3",
             div { class: "flex justify-between items-baseline gap-2 mb-1",
                 span { class: "text-sm font-semibold text-zinc-800 truncate", "{note.headline}" }
                 span { class: "text-[11px] text-zinc-400 shrink-0", "{format_local(note.created)}" }

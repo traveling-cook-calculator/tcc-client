@@ -89,3 +89,69 @@ pub fn render_resource<T: Clone + 'static>(
         Some(Ok(value)) => on_ready(value.clone()),
     }
 }
+
+// ── Notice ───────────────────────────────────────
+
+/// What a notice is about. The look follows the meaning, never the page it sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum NoticeTone {
+    /// Neutral information ("the details are locked").
+    #[default]
+    Info,
+    /// Something the reader should do or be aware of (amber).
+    Attention,
+    /// An error or an irreversible consequence (red).
+    Danger,
+    /// Something worked (green).
+    Success,
+}
+
+impl NoticeTone {
+    fn class(self) -> &'static str {
+        match self {
+            Self::Info => "border-zinc-200 bg-zinc-50 text-zinc-800",
+            Self::Attention => "border-amber-200 bg-amber-50 text-amber-900",
+            Self::Danger => "border-red-200 bg-red-50 text-red-800",
+            Self::Success => "border-green-200 bg-green-50 text-green-800",
+        }
+    }
+}
+
+/// The one box for messages inside a page: hints, warnings, errors, confirmations.
+///
+/// * `flat`: a full-width strip for the inside of a card (top border only, no rounding).
+/// * `small`: `text-xs` instead of `text-sm`, for secondary remarks.
+/// * `roomy`: more padding, for notices with several lines or an action.
+/// * `title`: optional bold first line.
+///
+/// Errors (`Danger`) are announced to screen readers at once (`role="alert"`), everything else
+/// politely (`role="status"`).
+#[component]
+pub fn Notice(
+    #[props(default)] tone: NoticeTone,
+    #[props(default)] flat: bool,
+    #[props(default)] small: bool,
+    /// More air (px-4 py-3) for notices that hold several lines or an action.
+    #[props(default)] roomy: bool,
+    #[props(default, into)] title: String,
+    #[props(default, into)] class: String,
+    children: Element,
+) -> Element {
+    let role = if tone == NoticeTone::Danger { "alert" } else { "status" };
+    let shape = if flat {
+        "border-t px-4 py-3"
+    } else if roomy {
+        "rounded-xl border px-4 py-3"
+    } else {
+        "rounded-xl border px-3 py-2"
+    };
+    let size = if small { "text-xs" } else { "text-sm" };
+    rsx! {
+        div { role, class: "{shape} {size} leading-relaxed {tone.class()} {class}",
+            if !title.is_empty() {
+                p { class: "font-semibold", "{title}" }
+            }
+            {children}
+        }
+    }
+}

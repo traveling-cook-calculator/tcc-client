@@ -3,7 +3,17 @@ use serde::Deserialize;
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct Config {
     pub auth: AuthConfig,
+    /// Where the API lives. Optional: without it the (older) behavior applies and `auth.audience`
+    /// doubles as the API address.
+    #[serde(default)]
+    pub api: Option<ApiConfig>,
     pub legal: LegalConfig,
+}
+
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ApiConfig {
+    /// Base URL of the API without a trailing slash, e.g. `https://api.example.org`.
+    pub base_url: String,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -38,6 +48,14 @@ pub struct LegalConfig {
     pub hosting_provider: String,
     pub server_location: String,
     pub data_retention_logs_days: u32,
+    /// Deletion periods of the API (`RETENTION_*` there). Only shown to the users; the API alone
+    /// decides. Missing values simply leave the sentence out.
+    #[serde(default)]
+    pub retention_canceled_team_days: Option<u32>,
+    #[serde(default)]
+    pub retention_participant_data_days: Option<u32>,
+    #[serde(default)]
+    pub retention_project_days: Option<u32>,
     pub privacy_last_updated: Option<String>,
 
     pub cookie_consent_enabled: bool,
@@ -98,6 +116,18 @@ impl LegalConfig {
 }
 
 impl Config {
+    /// Base URL for all API calls: `api.base_url`, otherwise the audience (legacy setups where the
+    /// audience is the public address of the API).
+    pub fn api_base_url(&self) -> String {
+        self.api
+            .as_ref()
+            .map(|api| api.base_url.trim())
+            .filter(|url| !url.is_empty())
+            .unwrap_or(self.auth.audience.as_str())
+            .trim_end_matches('/')
+            .to_string()
+    }
+
     pub async fn fetch() -> Result<Self, String> {
         let window = web_sys::window().expect("no global `window` exists");
         let location = window.location();
@@ -114,5 +144,57 @@ impl Config {
             Ok(response) => Err(format!("Request failed: {}", response.status())),
             Err(e) => Err(format!("Request error: {}", e)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth() -> AuthConfig {
+        AuthConfig {
+            domain: "https://auth.example.org".into(),
+            realm: "tcc".into(),
+            client_id: "tcc-client".into(),
+            redirect: "https://app.example.org".into(),
+            audience: "https://api.example.org/".into(),
+        }
+    }
+
+    fn legal() -> LegalConfig {
+        serde_json::from_str(
+            r#"{"operator_name":"o","address_street":"s","address_zip":"z","address_city":"c",
+                "address_country":"d","contact_email":"e","hosting_provider":"h","server_location":"l",
+                "data_retention_logs_days":7,"cookie_consent_enabled":false,"consent_version":"1",
+                "app_name":"a"}"#,
+        )
+        .expect("minimal legal config")
+    }
+
+    #[test]
+    fn the_api_url_falls_back_to_the_audience() {
+        let config = Config { auth: auth(), api: None, legal: legal() };
+        assert_eq!(config.api_base_url(), "https://api.example.org");
+    }
+
+    #[test]
+    fn an_explicit_api_url_wins_over_the_audience() {
+        let config = Config {
+            auth: auth(),
+            api: Some(ApiConfig { base_url: " https://api.other.org/ ".into() }),
+            legal: legal(),
+        };
+        assert_eq!(config.api_base_url(), "https://api.other.org");
+    }
+
+    #[test]
+    fn an_empty_api_url_counts_as_missing() {
+        let config = Config { auth: auth(), api: Some(ApiConfig { base_url: "  ".into() }), legal: legal() };
+        assert_eq!(config.api_base_url(), "https://api.example.org");
+    }
+
+    #[test]
+    fn retention_periods_are_optional() {
+        assert_eq!(legal().retention_project_days, None);
     }
 }

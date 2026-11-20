@@ -5,7 +5,9 @@ use crate::app::ConfigState;
 use crate::footer::Footer;
 use crate::keycloak::AuthState;
 use crate::side::CookieBanner;
-use crate::ui::{use_busy, ErrorView, LoadingView, Spinner, ToastHost};
+use crate::ui::{
+    menu_item_class, use_busy, ActionMenu, ErrorView, HeaderButton, LoadingView, MenuDivider, MenuItem, Spinner, ToastHost,
+};
 use crate::Route;
 use dioxus::prelude::*;
 use web_sys::window;
@@ -21,11 +23,18 @@ pub fn Wrapper() -> Element {
     let config = use_context::<ConfigState>();
     let route_state = route.to_state();
     let ready = config.is_ready();
+    let logged_in = matches!(
+        use_context::<Signal<Option<AuthState>>>().read().as_ref(),
+        Some(AuthState::LoggedIn(..))
+    );
     // Participants of a share link do not need (and must not be nudged to) log in.
     let show_auth = ready
         && !matches!(
             route,
-            Route::ShareRegisterPage { .. } | Route::TeamPage { .. } | Route::TeamVerifyPage { .. }
+            Route::ShareRegisterPage { .. }
+                | Route::TeamPage { .. }
+                | Route::TeamVerifyPage { .. }
+                | Route::TeamDeepLink { .. }
         );
 
     rsx! {
@@ -40,11 +49,23 @@ pub fn Wrapper() -> Element {
         div { class: "min-h-screen w-full flex flex-col bg-page",
             header { class: "sticky top-0 z-50 bg-surface border-b border-amber-200/60 shadow-sm",
                 div { class: "max-w-7xl mx-auto px-6 py-3 flex justify-between items-center w-full",
-                    Link { to: Route::Dashboard {}, class: "flex items-center gap-3",
-                        img { src: LOGO, alt: "Cook & Run", class: "h-8 w-auto" }
+                    Link {
+                        to: Route::Dashboard {},
+                        class: "flex items-center gap-3",
+                        img {
+                            src: LOGO,
+                            alt: "Cook & Run",
+                            class: "h-8 w-auto",
+                        }
                     }
                     if show_auth {
-                        div { class: "flex items-center gap-3", AuthButton { route_state } }
+                        div { class: "flex items-center gap-3",
+                            if logged_in {
+                                AccountMenu { route_state }
+                            } else {
+                                AuthButton { route_state }
+                            }
+                        }
                     }
                 }
             }
@@ -74,12 +95,6 @@ pub fn Wrapper() -> Element {
 //  Auth button (one component instead of five copy-pasted click handlers)
 // ─────────────────────────────────────────────
 
-const AUTH_BTN: &str = "flex items-center gap-2 px-3 py-1.5 rounded-xl text-sm font-medium \
-    text-zinc-600 bg-amber-50 border border-amber-200 \
-    hover:bg-amber-100 hover:border-amber-300 \
-    transition-colors duration-150 cursor-pointer \
-    disabled:opacity-60 disabled:cursor-not-allowed";
-
 #[component]
 fn AuthButton(route_state: String) -> Element {
     let mut auth = use_context::<Signal<Option<AuthState>>>();
@@ -96,9 +111,7 @@ fn AuthButton(route_state: String) -> Element {
     let pending = pending || task.is_busy();
 
     rsx! {
-        button {
-            r#type: "button",
-            class: AUTH_BTN,
+        HeaderButton {
             disabled,
             onclick: move |_| {
                 // Snapshot at click time; no signal guard is held while awaiting.
@@ -130,6 +143,73 @@ fn AuthButton(route_state: String) -> Element {
                 }
             }
             "{label}"
+        }
+    }
+}
+
+// ─────────────────────────────────────────────
+//  Account menu (logged in): one symbol, one small window
+// ─────────────────────────────────────────────
+
+/// The avatar button that opens a small window with the account entries: the account page (data
+/// overview, export, deletion), the profile at Keycloak and logout. Closes after a click on an
+/// entry, a click outside of it, or Escape.
+#[component]
+fn AccountMenu(route_state: String) -> Element {
+    let mut auth = use_context::<Signal<Option<AuthState>>>();
+    let task = use_busy();
+    let current = auth.read().clone();
+    let user = current.as_ref().and_then(|state| state.user().cloned());
+    let console_url = current.as_ref().and_then(AuthState::account_console_url);
+    let name = user
+        .as_ref()
+        .and_then(|user| user.preferred_username.clone().or_else(|| user.email.clone()))
+        .unwrap_or_default();
+    let email = user.as_ref().and_then(|user| user.email.clone()).filter(|email| *email != name);
+
+    let on_logout = move |_| {
+        let Some(state) = auth.peek().clone() else { return };
+        task.run(async move {
+            let (next, url) = state.logout().await;
+            auth.set(Some(next));
+            if let (Some(win), Some(url)) = (window(), url) {
+                let _ = win.location().set_href(&url);
+            }
+        });
+    };
+    let _ = route_state;
+
+    rsx! {
+        ActionMenu {
+            label: "Account menu",
+            header: true,
+            trigger: rsx! {
+                if task.is_busy() {
+                    Spinner { class: "w-3.5 h-3.5 text-amber-400" }
+                }
+                img { src: PROFILE, alt: "", class: "h-6 w-6 rounded-full border border-amber-200" }
+                span { class: "hidden sm:inline max-w-[10rem] truncate", "{name}" }
+            },
+            div { class: "px-3 py-2",
+                p { class: "text-sm font-semibold text-ink-brown truncate", "{name}" }
+                if let Some(email) = email {
+                    p { class: "text-xs text-zinc-500 truncate", "{email}" }
+                }
+            }
+            MenuDivider {}
+            Link { to: Route::Account {}, class: menu_item_class(false), "role": "menuitem", "Account & data" }
+            if let Some(url) = console_url {
+                a {
+                    href: "{url}",
+                    target: "_blank",
+                    rel: "noopener noreferrer",
+                    role: "menuitem",
+                    class: menu_item_class(false),
+                    "Edit profile (opens in a new tab)"
+                }
+            }
+            MenuDivider {}
+            MenuItem { label: "Logout", onclick: on_logout }
         }
     }
 }

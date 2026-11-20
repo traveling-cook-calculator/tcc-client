@@ -5,11 +5,12 @@ use uuid::Uuid;
 
 use super::draft::TeamDraft;
 use super::form::TeamFields;
+use super::history::TeamHistory;
 use super::notes::TeamNotes;
 use crate::data::use_storage;
 use crate::side::details::address::AddressParam;
 use crate::side::participant::team_url;
-use crate::storage::{AddressData, TeamData, TeamStatus};
+use crate::storage::{AddressData, TeamAccess, TeamData, TeamStatus};
 use crate::time::format_local;
 use crate::ui::*;
 
@@ -24,7 +25,7 @@ pub fn AddTeamDialog(cook_and_run_id: Uuid, onclose: EventHandler<()>) -> Elemen
     let create_task = use_busy();
 
     let draft = use_signal(TeamDraft::default);
-    let address = AddressParam::new(&AddressData::default());
+    let address = AddressParam::new(&AddressData::empty());
     let mut attempted = use_signal(|| false);
 
     let on_create = move |_| {
@@ -197,7 +198,7 @@ fn EditTeamForm(cook_and_run_id: Uuid, team: TeamData, onclose: EventHandler<()>
 
     let header_actions = rsx! {
         if canceled {
-            Pill { tone: PillTone::Neutral, "Canceled" }
+            Pill { tone: PillTone::Red, "Canceled" }
         } else {
             Checkbox {
                 label: "Needs review",
@@ -227,11 +228,12 @@ fn EditTeamForm(cook_and_run_id: Uuid, team: TeamData, onclose: EventHandler<()>
     rsx! {
         div { class: "space-y-5",
             if canceled {
-                CanceledNotice { team: team.clone() }
+                CanceledNotice { cook_and_run_id, team: team.clone(), onclose }
             }
 
             Tabs {
-                tabs: vec!["Team Data", "Notes"],
+                // The change log exists for teams of a cloud project only.
+                tabs: if team.cloud.is_some() { vec!["Team Data", "Notes", "History"] } else { vec!["Team Data", "Notes"] },
                 selected: tab(),
                 onselect: move |index| tab.set(index),
                 actions: header_actions,
@@ -239,6 +241,16 @@ fn EditTeamForm(cook_and_run_id: Uuid, team: TeamData, onclose: EventHandler<()>
 
             if tab() == 0 {
                 TeamFields { draft, address, show_all_errors: true, disabled: canceled }
+                if team.cloud.is_some() && !canceled {
+                    InvitationBlock {
+                        cook_and_run_id,
+                        team_id,
+                        stored_mail: team.mail.clone(),
+                        verified_at: team.cloud.as_ref().and_then(|cloud| cloud.email_verified_at),
+                        // A new address has to be saved first: the invitation goes to the stored one.
+                        mail_unsaved: current.mail.trim() != team.mail.clone().unwrap_or_default().trim(),
+                    }
+                }
                 if let Some(cloud) = &team.cloud {
                     CopyField {
                         label: "Team link",
@@ -257,29 +269,167 @@ fn EditTeamForm(cook_and_run_id: Uuid, team: TeamData, onclose: EventHandler<()>
                         }
                     }
                 }
-            } else {
+            } else if tab() == 1 {
                 TeamNotes { cook_and_run_id, team_id, notes: team.note_list.clone() }
+            } else {
+                TeamHistory { cook_and_run_id, team_id }
             }
         }
     }
 }
 
+/// The invitation mail of a team: whether the address is confirmed, and sending the mail again.
+/// Sending is always possible (also when the address is confirmed: the mail then only carries the
+/// team link). While it is not confirmed every mail has a new confirmation link, the old one
+/// stops working.
 #[component]
-fn CanceledNotice(team: TeamData) -> Element {
+fn InvitationBlock(
+    cook_and_run_id: Uuid,
+    team_id: Uuid,
+    stored_mail: Option<String>,
+    verified_at: Option<chrono::NaiveDateTime>,
+    mail_unsaved: bool,
+) -> Element {
+    let storage = use_storage();
+    let toasts = use_toasts();
+    let send_task = use_busy();
+    let mut confirm = use_signal(|| false);
+
+    let has_mail = stored_mail.is_some();
+    let blocked = !has_mail || mail_unsaved;
+    let (tone, state) = match (&stored_mail, verified_at) {
+        (None, _) => (PillTone::Neutral, "No email address".to_string()),
+        (Some(_), Some(at)) => (PillTone::Green, format!("Confirmed on {}", format_local(at))),
+        (Some(_), None) => (PillTone::Amber, "Not confirmed yet".to_string()),
+    };
+    let explanation = if !has_mail {
+        "Enter an email address and save the team to be able to send the invitation."
+    } else if mail_unsaved {
+        "Save the new email address first: the invitation goes to the stored address."
+    } else if verified_at.is_some() {
+        "The team confirmed its address. The invitation can still be sent again; it then only contains the team link."
+    } else {
+        "The team has not confirmed its address yet. Sending the invitation again creates a new confirmation link and invalidates the previous one."
+    };
+    let button = if verified_at.is_some() { "Send invitation again" } else { "Send invitation again (new link)" };
+
+    let on_send = move |_| {
+        send_task.run(async move {
+            let result = {
+                storage
+                    .read()
+                    .await
+                    .resend_team_verification(cook_and_run_id, team_id, &TeamAccess::Admin)
+                    .await
+            };
+            match result {
+                Ok(()) => {
+                    confirm.set(false);
+                    toasts.success("Invitation sent", "The email is queued and goes out shortly.");
+                    // The history shows the new entry.
+                    storage.invalidate();
+                }
+                Err(e) => toasts.error("Sending the invitation failed", e),
+            }
+        });
+    };
+
+    rsx! {
+        Panel { class: "space-y-2.5",
+            div { class: "flex flex-wrap items-center gap-2",
+                Eyebrow { text: "Invitation email" }
+                Pill { tone, "{state}" }
+            }
+            Hint { "{explanation}" }
+            if confirm() {
+                div { class: "flex flex-wrap items-center gap-3",
+                    span { class: "text-xs text-zinc-700", "Send the invitation to {stored_mail.clone().unwrap_or_default()}?" }
+                    Button { label: "Send", loading: send_task.is_busy(), onclick: on_send }
+                    Button {
+                        label: "Cancel",
+                        variant: ButtonVariant::Secondary,
+                        disabled: send_task.is_busy(),
+                        onclick: move |_| confirm.set(false),
+                    }
+                }
+            } else {
+                div {
+                    Button {
+                        label: button,
+                        variant: ButtonVariant::Secondary,
+                        disabled: blocked,
+                        onclick: move |_| confirm.set(true),
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A team that canceled: everything is read-only and the organiser decides what happens next.
+/// The diets, member count and address are already deleted; confirming the cancellation deletes
+/// the rest (the team with its contact data and history).
+#[component]
+fn CanceledNotice(cook_and_run_id: Uuid, team: TeamData, onclose: EventHandler<()>) -> Element {
+    let storage = use_storage();
+    let toasts = use_toasts();
+    let delete_task = use_busy();
+    let mut confirm = use_signal(|| false);
+
     let cloud = team.cloud.as_ref();
     let when = cloud.and_then(|c| c.canceled_at).map(format_local);
     let reason = cloud.and_then(|c| c.cancel_reason.clone()).filter(|r| !r.trim().is_empty());
+    let team_id = team.id;
+
+    let on_confirm = move |_| {
+        delete_task.run(async move {
+            let result = { storage.write().await.delete_team_of_cook_and_run(cook_and_run_id, team_id).await };
+            match result {
+                Ok(()) => {
+                    storage.invalidate();
+                    toasts.success("Cancellation confirmed", "The team and its remaining data are deleted.");
+                    onclose.call(());
+                }
+                Err(e) => toasts.error("Confirming the cancellation failed", e),
+            }
+        });
+    };
 
     rsx! {
-        div { class: "rounded-xl border border-red-200 bg-red-50 px-4 py-3 space-y-1",
-            p { class: "text-sm font-semibold text-red-700",
-                "This team canceled its participation and can no longer be edited."
-            }
+        Notice { tone: NoticeTone::Danger, roomy: true, class: "space-y-2", title: "This team canceled its participation and can no longer be edited.",
             if let Some(when) = when {
-                p { class: "text-xs text-red-600", "Canceled on {when}" }
+                p { class: "text-xs", "Canceled on {when}" }
             }
             if let Some(reason) = reason {
-                p { class: "text-xs text-red-600 whitespace-pre-wrap", "Reason: {reason}" }
+                p { class: "text-xs whitespace-pre-wrap", "Reason: {reason}" }
+            }
+            p { class: "text-xs",
+                "Address, dietary requirements and number of members are already deleted. Name, email and phone are kept until you confirm the cancellation: that deletes the team for good."
+            }
+            if confirm() {
+                div { class: "flex flex-wrap items-center gap-3",
+                    span { class: "text-xs font-medium text-red-700", "Delete this team for good?" }
+                    Button {
+                        label: "Confirm and delete",
+                        variant: ButtonVariant::Danger,
+                        loading: delete_task.is_busy(),
+                        onclick: on_confirm,
+                    }
+                    Button {
+                        label: "Back",
+                        variant: ButtonVariant::Secondary,
+                        disabled: delete_task.is_busy(),
+                        onclick: move |_| confirm.set(false),
+                    }
+                }
+            } else {
+                div {
+                    Button {
+                        label: "Confirm cancellation",
+                        variant: ButtonVariant::DangerOutline,
+                        onclick: move |_| confirm.set(true),
+                    }
+                }
             }
         }
     }

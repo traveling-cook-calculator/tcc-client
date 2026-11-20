@@ -5,6 +5,7 @@ use dioxus::prelude::*;
 use uuid::Uuid;
 
 use crate::data::use_storage;
+use crate::keycloak::AuthState;
 use crate::storage::{CookAndRunCreate, CookAndRunData, CookAndRunMetaData};
 use crate::time::{format_date, to_local};
 use crate::ui::*;
@@ -327,26 +328,77 @@ fn LoadingCard() -> Element {
 //  Create / import dialog
 // ─────────────────────────────────────────────
 
+/// Same rule as in the Overview: the backend needs an address that is notified about the project.
+fn email_error(email: &str) -> String {
+    if email.trim().is_empty() {
+        return "Please enter an email address.".to_string();
+    }
+    CookAndRunCreate { name: "Project".to_string(), admin_notification_email: Some(email.trim().to_string()) }
+        .validate()
+        .err()
+        .unwrap_or_default()
+}
+
 #[component]
 fn CreateProjectDialog(onclose: EventHandler<()>) -> Element {
     let storage = use_storage();
     let toasts = use_toasts();
     let navigator = use_navigator();
+    let auth = use_context::<Signal<Option<AuthState>>>();
     let create_task = use_busy();
     let import_task = use_busy();
 
     let mut name = use_signal(String::new);
     let mut touched = use_signal(|| false);
 
-    let new_project = CookAndRunCreate::new(name.read().trim().to_string());
-    let validation = new_project.validate().err();
-    let shown_error = if touched() { validation.clone().unwrap_or_default() } else { String::new() };
+    // ── Cloud option ─────────────────────────────────────────────────────────
+    // Offered when the user is logged in *and* the cloud connection is up. The box is ticked
+    // automatically in that case; `cloud_choice` only remembers an explicit click.
+    let connected = use_resource(move || async move {
+        let _ = storage.revision();
+        storage.is_cloud_connected().await
+    });
+    let user_email = match auth.read().as_ref() {
+        Some(AuthState::LoggedIn(_, _, session)) => Some(session.user.email.clone().unwrap_or_default()),
+        _ => None,
+    };
+    let logged_in = user_email.is_some();
+    let cloud_ready = logged_in && matches!(&*connected.read_unchecked(), Some(true));
+    let mut cloud_choice = use_signal(|| None::<bool>);
+    let mut email = use_signal(move || user_email.clone().unwrap_or_default());
+    let use_cloud = cloud_ready && cloud_choice().unwrap_or(true);
+    let cloud_hint = if !logged_in {
+        Some("Log in to store projects in the cloud. Until then the project is stored on this device.")
+    } else if matches!(&*connected.read_unchecked(), Some(false)) {
+        Some("The cloud connection is not available. The project is stored on this device.")
+    } else {
+        None
+    };
 
-    let on_create = move |_| {
-        let project = CookAndRunCreate::new(name.peek().trim().to_string());
+    let name_text = name.read().trim().to_string();
+    let name_validation = CookAndRunCreate::new(name_text.clone()).validate().err();
+    let shown_error = if touched() { name_validation.clone().unwrap_or_default() } else { String::new() };
+    let email_value = email.read().clone();
+    let email_validation = if use_cloud { email_error(&email_value) } else { String::new() };
+    let shown_email_error = if email_value.is_empty() { String::new() } else { email_validation.clone() };
+    let can_create = name_validation.is_none() && email_validation.is_empty();
+
+    // Shared by the button and the Enter key.
+    let create = move || {
+        let project = CookAndRunCreate {
+            name: name.peek().trim().to_string(),
+            admin_notification_email: use_cloud.then(|| email.peek().trim().to_string()),
+        };
         create_task.run(async move {
             let id = Uuid::new_v4();
-            let result = { storage.write().await.create_cook_and_run(id, &project).await };
+            let result = {
+                let mut manager = storage.write().await;
+                if use_cloud {
+                    manager.create_cook_and_run_in_cloud(id, &project).await
+                } else {
+                    manager.create_cook_and_run(id, &project).await
+                }
+            };
             match result {
                 Ok(()) => {
                     storage.invalidate();
@@ -394,8 +446,40 @@ fn CreateProjectDialog(onclose: EventHandler<()>) -> Element {
                         touched.set(true);
                         name.set(e.value());
                     },
+                    // Enter creates the project as soon as the form is valid.
+                    onenter: move |_| {
+                        touched.set(true);
+                        if can_create && !create_task.is_busy() {
+                            create();
+                        }
+                    },
                 }
             }
+
+            Checkbox {
+                label: "Upload to the cloud",
+                checked: use_cloud,
+                disabled: !cloud_ready,
+                onchange: move |checked| cloud_choice.set(Some(checked)),
+            }
+            if let Some(hint) = cloud_hint {
+                p { class: "text-xs text-zinc-400 -mt-2", "{hint}" }
+            }
+            if use_cloud {
+                Field {
+                    label: "Admin notification email",
+                    error: shown_email_error.clone(),
+                    hint: "Receives notifications about this project.".to_string(),
+                    TextInput {
+                        kind: InputKind::Email,
+                        value: email_value.clone(),
+                        placeholder: "admin@example.com",
+                        error: !shown_email_error.is_empty(),
+                        oninput: move |e: Event<FormData>| email.set(e.value()),
+                    }
+                }
+            }
+
             div { class: "flex items-center gap-3 pt-2",
                 // A <label> wrapping the hidden file input opens the file picker natively.
                 label { class: "{button_class(ButtonVariant::Secondary)}",
@@ -403,19 +487,13 @@ fn CreateProjectDialog(onclose: EventHandler<()>) -> Element {
                         Spinner {}
                     }
                     "Import file"
-                    input {
-                        r#type: "file",
-                        accept: ".tcc",
-                        multiple: false,
-                        class: "hidden",
-                        onchange: on_import,
-                    }
+                    FileInput { id: "project-import-input", accept: ".tcc", onpick: on_import }
                 }
                 Button {
                     label: "Create",
                     loading: create_task.is_busy(),
-                    disabled: validation.is_some(),
-                    onclick: on_create,
+                    disabled: !can_create,
+                    onclick: move |_| create(),
                 }
             }
         }

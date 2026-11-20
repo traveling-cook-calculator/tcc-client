@@ -23,6 +23,24 @@ pub fn Callback(code: String, state: String) -> Element {
         handled.set(true);
 
         let (code, state) = (code.clone(), state.clone());
+
+        // Keycloak sends the browser back after "delete account": no login to finish, the session
+        // is gone either way. `kc_action_status` tells whether the user went through with it.
+        if crate::web::account_deletion_pending() {
+            crate::web::set_account_deletion_pending(false);
+            let status = crate::web::query_param("kc_action_status").unwrap_or_default();
+            auth.set(Some(current.finish_account_deletion()));
+            match status.as_str() {
+                "success" => toasts.success("Account deleted", "Your data and your login account are gone."),
+                _ => toasts.info(
+                    "Account not deleted",
+                    "Your data in the app was deleted, but the login account still exists. You can delete it in your account settings at the login provider.",
+                ),
+            }
+            navigator.replace(Route::Dashboard {});
+            return;
+        }
+
         spawn(async move {
             // Where to go afterwards is part of the pending login.
             let return_to = match &current {

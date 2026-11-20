@@ -7,12 +7,18 @@ use uuid::Uuid;
 use web_sys::console;
 
 use crate::{
+    design_wire,
     keycloak::{AuthState, SessionData},
+    schedule_design::{RemoteImage, ScheduleDesign},
     storage::{
+        design::{
+            self, CloudDesign, CloudLibrary, DesignError, DesignErrorKind, DesignFetch, DesignList,
+            DesignMeta, ImageData, ImageMode, LoadedDesign,
+        },
         validate_cancel_reason, AddressData, AuditAction, AuditActorType, AuditChangedField,
         AuditLogEntry, CookAndRunCreate, CookAndRunData, CookAndRunMetaData, CookAndRunMetaUpdate,
         CourseCreate, CourseData, CourseUpdate, HealthData, HealthStatus, HostingData,
-        MeetingPointData, NoteCreate, NoteData, Page, PaginationData, PlanConfigData, PlanData,
+        MeetingPointData, NoteCreate, NoteData, Page, PaginationData, PlanData,
         ProjectSort, RequiredField, ShareTeamConfig, ShareTeamConfigCreate, Storage, TeamAccess,
         TeamCloudData, TeamCreate, TeamData, TeamMetaData, TeamPlanData, TeamRegistration,
         TeamSort, TeamStatus, TeamUpdate,
@@ -98,10 +104,19 @@ impl TraceContext {
 enum Auth {
     /// No credentials at all.
     Anonymous,
-    /// `Authorization: Bearer <access token of the logged in user>`.
+    /// `Authorization: Bearer <access token of the logged in user>`. Without a login the request
+    /// is not sent at all ("No auth data!").
     Bearer,
     /// `x-access-token: <team token>`, the bearer token is deliberately not sent.
     Token(String),
+}
+
+/// The bearer token a request carries. `Bearer` needs a login; the other variants never send it.
+fn bearer_token(auth: &Auth, access_token: Option<String>) -> Result<Option<String>, &'static str> {
+    match auth {
+        Auth::Bearer => access_token.map(Some).ok_or("No auth data!"),
+        Auth::Anonymous | Auth::Token(_) => Ok(None),
+    }
 }
 
 fn auth_for(access: &TeamAccess) -> Auth {
@@ -118,6 +133,10 @@ struct Req {
     query: Vec<(&'static str, String)>,
     auth: Auth,
     body: Option<String>,
+    /// Raw bytes (a picture); sent as `application/octet-stream`.
+    raw: Option<Vec<u8>>,
+    /// Extra headers such as `If-Match`.
+    headers: Vec<(&'static str, String)>,
 }
 
 impl Req {
@@ -128,6 +147,8 @@ impl Req {
             query: Vec::new(),
             auth: Auth::Bearer,
             body: None,
+            raw: None,
+            headers: Vec::new(),
         }
     }
 
@@ -149,6 +170,21 @@ impl Req {
 
     fn auth(mut self, auth: Auth) -> Self {
         self.auth = auth;
+        self
+    }
+
+    fn header(mut self, name: &'static str, value: impl ToString) -> Self {
+        self.headers.push((name, value.to_string()));
+        self
+    }
+
+    fn raw(mut self, bytes: Vec<u8>) -> Self {
+        self.raw = Some(bytes);
+        self
+    }
+
+    fn json_text(mut self, body: String) -> Self {
+        self.body = Some(body);
         self
     }
 
@@ -337,6 +373,8 @@ struct TeamResponse {
     phone: Option<String>,
     members: Option<i32>,
     diets: Option<String>,
+    /// The organiser's id: only in the organiser's view of a team.
+    #[serde(default)]
     created_by_user: Option<String>,
     created: DateTime<Utc>,
     edited: DateTime<Utc>,
@@ -344,14 +382,28 @@ struct TeamResponse {
     canceled_at: Option<DateTime<Utc>>,
     cancel_reason: Option<String>,
     email_verified_at: Option<DateTime<Utc>>,
+    /// Not part of what a team gets to see of itself (the caller knows its token).
+    #[serde(default)]
     last_route_hash: Option<String>,
-    access_token: String,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    verification_resends_left: Option<u8>,
 }
 
 impl TeamResponse {
-    fn into_team(self, note_list: Vec<NoteData>) -> Result<TeamData, String> {
-        let access_token = Uuid::parse_str(&self.access_token)
-            .map_err(|e| format!("Team {} has an invalid access token: {}", self.id, e))?;
+    /// `known_token`: the token the caller used (a team's own view does not repeat it).
+    fn into_team(
+        self,
+        note_list: Vec<NoteData>,
+        known_token: Option<Uuid>,
+    ) -> Result<TeamData, String> {
+        let access_token = match (&self.access_token, known_token) {
+            (Some(token), _) => Uuid::parse_str(token)
+                .map_err(|e| format!("Team {} has an invalid access token: {}", self.id, e))?,
+            (None, Some(token)) => token,
+            (None, None) => return Err(format!("Team {} came without an access token", self.id)),
+        };
         Ok(TeamData {
             id: self.id,
             name: self.name,
@@ -370,6 +422,7 @@ impl TeamResponse {
                 cancel_reason: self.cancel_reason,
                 email_verified_at: self.email_verified_at.map(to_naive),
                 last_route_hash: self.last_route_hash,
+                verification_resends_left: self.verification_resends_left,
             }),
             note_list,
         })
@@ -422,6 +475,9 @@ struct TeamCreateRequest<'a> {
     phone: &'a Option<String>,
     members: &'a Option<u16>,
     diets: &'a Option<String>,
+    /// Bot trap (the field is called `website` on the wire); only bots fill it.
+    #[serde(rename = "website", skip_serializing_if = "Option::is_none")]
+    honeypot: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -485,6 +541,8 @@ struct ShareConfigResponse {
     invite_text: String,
     require_email_verification: bool,
     default_needs_check: bool,
+    #[serde(default)]
+    allowed_fields: Option<Vec<RequiredField>>,
     required_fields: Vec<RequiredField>,
     max_teams: Option<u32>,
     registration_deadline: Option<DateTime<Utc>>,
@@ -502,6 +560,9 @@ impl ShareConfigResponse {
             invite_text: self.invite_text,
             require_email_verification: self.require_email_verification,
             default_needs_check: self.default_needs_check,
+            allowed_fields: self
+                .allowed_fields
+                .unwrap_or_else(|| self.required_fields.clone()),
             required_fields: self.required_fields,
             max_teams: self.max_teams,
             registration_deadline: self.registration_deadline.map(to_naive),
@@ -511,8 +572,61 @@ impl ShareConfigResponse {
             notify_admin_on_create: self.notify_admin_on_create,
             notify_admin_on_cancel: self.notify_admin_on_cancel,
             created: to_naive(self.created),
+            registration_full: false,
+            plan_published: false,
         }
     }
+}
+
+/// `GET .../share_team_config/public`: the organizer's configuration without `notify_admin_*`.
+/// (`project_name` is part of the response and ignored here.)
+#[derive(Debug, Deserialize)]
+struct PublicShareConfigResponse {
+    invite_text: String,
+    require_email_verification: bool,
+    default_needs_check: bool,
+    /// Older servers: what is required was what was shown.
+    #[serde(default)]
+    allowed_fields: Option<Vec<RequiredField>>,
+    required_fields: Vec<RequiredField>,
+    max_teams: Option<u32>,
+    registration_deadline: Option<DateTime<Utc>>,
+    edit_deadline: Option<DateTime<Utc>>,
+    review_trigger_fields: Vec<RequiredField>,
+    #[serde(default)]
+    registration_full: bool,
+    #[serde(default)]
+    plan_published: bool,
+    created: DateTime<Utc>,
+}
+
+impl PublicShareConfigResponse {
+    fn into_config(self) -> ShareTeamConfig {
+        ShareTeamConfig {
+            invite_text: self.invite_text,
+            require_email_verification: self.require_email_verification,
+            default_needs_check: self.default_needs_check,
+            allowed_fields: self
+                .allowed_fields
+                .unwrap_or_else(|| self.required_fields.clone()),
+            required_fields: self.required_fields,
+            registration_full: self.registration_full,
+            plan_published: self.plan_published,
+            max_teams: self.max_teams,
+            registration_deadline: self.registration_deadline.map(to_naive),
+            edit_deadline: self.edit_deadline.map(to_naive),
+            review_trigger_fields: self.review_trigger_fields,
+            // Not sent to guests; the participant pages never read them.
+            notify_admin_on_review: false,
+            notify_admin_on_create: false,
+            notify_admin_on_cancel: false,
+            created: to_naive(self.created),
+        }
+    }
+}
+
+fn public_share_config_path(project_id: Uuid) -> String {
+    format!("{}/share_team_config/public", project_path(project_id))
 }
 
 #[derive(Debug, Serialize)]
@@ -520,6 +634,7 @@ struct ShareConfigRequest {
     invite_text: String,
     require_email_verification: bool,
     default_needs_check: bool,
+    allowed_fields: Vec<RequiredField>,
     required_fields: Vec<RequiredField>,
     max_teams: Option<u32>,
     registration_deadline: Option<DateTime<Utc>>,
@@ -536,6 +651,7 @@ impl From<&ShareTeamConfigCreate> for ShareConfigRequest {
             invite_text: config.invite_text.clone(),
             require_email_verification: config.require_email_verification,
             default_needs_check: config.default_needs_check,
+            allowed_fields: config.allowed_fields.clone(),
             required_fields: config.required_fields.clone(),
             max_teams: config.max_teams,
             registration_deadline: config.registration_deadline.map(to_utc),
@@ -593,6 +709,43 @@ struct RouteMailRequest<'a> {
     sent_to_team_ids: &'a [Uuid],
 }
 
+#[derive(Debug, Deserialize)]
+struct DesignMetaResponse {
+    id: Uuid,
+    name: String,
+    ratio: f32,
+    revision: u32,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    approx_bytes: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DesignListResponse {
+    #[serde(default)]
+    active: Option<Uuid>,
+    data: Vec<DesignMetaResponse>,
+}
+
+/// `design_id` is mandatory in the body, `null` switches the design off.
+#[derive(Debug, Serialize)]
+struct ActiveDesignRequest {
+    design_id: Option<Uuid>,
+}
+
+/// Where the pictures of a design are read from.
+#[derive(Clone, Copy)]
+enum ImageSource<'a> {
+    Owner(Uuid),
+    Team(Uuid, Uuid, &'a TeamAccess),
+}
+
+fn design_error(error: ApiError) -> DesignError {
+    let kind = design::classify(error.status.map(|status| status.as_u16()), &error.message);
+    let message = if error.message.is_empty() { error.to_string() } else { error.message };
+    DesignError::new(kind, message)
+}
+
 fn project_path(project_id: Uuid) -> String {
     format!("/project/{}", project_id)
 }
@@ -635,6 +788,14 @@ impl CloudStorage {
         };
         cloud_storage.check_health().await?;
         Ok(cloud_storage)
+    }
+
+    /// Swaps in a renewed session (new access token) without reconnecting. Anonymous
+    /// (participant) connections stay anonymous.
+    pub fn update_auth(&mut self, auth_state: AuthState) {
+        if self.auth_state.is_some() {
+            self.auth_state = Some(auth_state);
+        }
     }
 
     fn session(&self) -> Option<SessionData> {
@@ -683,14 +844,8 @@ impl CloudStorage {
                 .map_err(|e| ApiError::local(format!("Invalid request URL: {}", e)))?
                 .to_string()
         };
-        let bearer = match &req.auth {
-            Auth::Bearer => Some(
-                self.session()
-                    .ok_or_else(|| ApiError::local("No auth data!"))?
-                    .access_token,
-            ),
-            _ => None,
-        };
+        let bearer = bearer_token(&req.auth, self.session().map(|session| session.access_token))
+            .map_err(ApiError::local)?;
 
         let mut attempt: u32 = 0;
         loop {
@@ -707,10 +862,17 @@ impl CloudStorage {
                     builder = builder.header("x-access-token", token.as_str());
                 }
             }
+            for (name, value) in &req.headers {
+                builder = builder.header(*name, value.as_str());
+            }
             if let Some(body) = &req.body {
                 builder = builder
                     .header(CONTENT_TYPE, "application/json")
                     .body(body.clone());
+            } else if let Some(bytes) = &req.raw {
+                builder = builder
+                    .header(CONTENT_TYPE, "application/octet-stream")
+                    .body(bytes.clone());
             }
 
             let response = builder
@@ -831,7 +993,11 @@ impl CloudStorage {
                 Req::get(team_path(project_id, team_id)).auth(auth_for(access)),
             )
             .await?;
-        response.into_team(Vec::new())
+        let known_token = match access {
+            TeamAccess::Token(token) => Some(*token),
+            TeamAccess::Admin => None,
+        };
+        response.into_team(Vec::new(), known_token)
     }
 
     async fn fetch_notes(
@@ -972,19 +1138,6 @@ impl CloudStorage {
         }
     }
 
-    async fn fetch_plan_config(
-        &self,
-        trace: &TraceContext,
-        project_id: Uuid,
-    ) -> Result<Option<PlanConfigData>, String> {
-        let req = Req::get(format!("{}/plan_config", project_path(project_id)));
-        match self.call_json::<PlanConfigData>(trace, req).await {
-            Ok(config) => Ok(Some(config)),
-            Err(e) if e.is_not_found() => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-
     async fn patch_team(
         &self,
         trace: &TraceContext,
@@ -1102,6 +1255,8 @@ impl CloudStorage {
 
     // ----- share configuration ---------------------------------------------------------------
 
+    /// The full configuration, for the organizer only (login required, project owner).
+    /// Guests use [`Self::select_public_share_config`].
     pub async fn select_cook_and_run_share_config(
         &self,
         project_id: Uuid,
@@ -1109,6 +1264,22 @@ impl CloudStorage {
         let trace = TraceContext::new();
         let req = Req::get(format!("{}/share_team_config", project_path(project_id)));
         match self.call_json::<ShareConfigResponse>(&trace, req).await {
+            Ok(config) => Ok(Some(config.into_config())),
+            Err(e) if e.is_not_found_with("Sharing configuration") => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The configuration as the registration page and the team page need it, **without a login**
+    /// (`GET .../share_team_config/public`). The `notify_admin_*` flags are organizer-only and come
+    /// back as `false`; do not use the result to edit the configuration.
+    pub async fn select_public_share_config(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<ShareTeamConfig>, String> {
+        let trace = TraceContext::new();
+        let req = Req::get(public_share_config_path(project_id)).auth(Auth::Anonymous);
+        match self.call_json::<PublicShareConfigResponse>(&trace, req).await {
             Ok(config) => Ok(Some(config.into_config())),
             Err(e) if e.is_not_found_with("Sharing configuration") => Ok(None),
             Err(e) => Err(e.into()),
@@ -1224,6 +1395,7 @@ impl CloudStorage {
             phone: &team.phone,
             members: &team.members,
             diets: &team.diets,
+            honeypot: team.honeypot.as_deref(),
         };
         self.call_unit(
             &trace,
@@ -1258,18 +1430,26 @@ impl CloudStorage {
             .await
     }
 
-    /// Confirms the email address (team token only).
+    /// Confirms the email address: needs the team token AND the secret of the mail link.
     pub async fn verify_team_email(
         &self,
         project_id: Uuid,
         team_id: Uuid,
         access_token: Uuid,
+        secret: Uuid,
     ) -> Result<(), String> {
+        #[derive(Serialize)]
+        struct VerifyRequest {
+            secret: String,
+        }
         let trace = TraceContext::new();
         self.call_unit(
             &trace,
             Req::post(format!("{}/verify", team_path(project_id, team_id)))
-                .auth(Auth::Token(access_token.to_string())),
+                .auth(Auth::Token(access_token.to_string()))
+                .json(&VerifyRequest {
+                    secret: secret.to_string(),
+                })?,
         )
         .await?;
         Ok(())
@@ -1293,6 +1473,50 @@ impl CloudStorage {
         )
         .await?;
         Ok(())
+    }
+
+    /// The data stored about the team, exactly as the API returns it (JSON text, for the download).
+    pub async fn export_team(
+        &self,
+        project_id: Uuid,
+        team_id: Uuid,
+        access_token: Uuid,
+    ) -> Result<String, String> {
+        let trace = TraceContext::new();
+        let response = self
+            .call(
+                &trace,
+                Req::get(team_path(project_id, team_id)).auth(Auth::Token(access_token.to_string())),
+            )
+            .await?;
+        response
+            .text()
+            .await
+            .map_err(|e| format!("Response could not be read: {}", e))
+    }
+
+    /// Everything stored about the logged in user (JSON text, Art. 15 and 20 GDPR).
+    pub async fn export_account_data(&self) -> Result<String, String> {
+        let trace = TraceContext::new();
+        let response = self.call(&trace, Req::get("/me/export".to_string())).await?;
+        response
+            .text()
+            .await
+            .map_err(|e| format!("Response could not be read: {}", e))
+    }
+
+    /// Deletes all projects of the logged in user with everything that belongs to them (Art. 17
+    /// GDPR). Returns the number of deleted projects. Repeating the call is safe.
+    pub async fn erase_account_data(&self) -> Result<u64, String> {
+        #[derive(Deserialize)]
+        struct Erased {
+            deleted_projects: u64,
+        }
+        let trace = TraceContext::new();
+        let erased: Erased = self
+            .call_json(&trace, Req::delete("/me".to_string()).query("confirm", "true"))
+            .await?;
+        Ok(erased.deleted_projects)
     }
 
     pub async fn resend_team_verification(
@@ -1329,6 +1553,487 @@ impl CloudStorage {
             )
             .await?;
         Ok(plan)
+    }
+
+    // ----- designs ("Laufzettel") ------------------------------------------------------------
+    //
+    // See `design.rs` for the types and `design_wire.rs` for the JSON. Owners use the `Bearer`
+    // routes under `/project/{id}`, teams the read-only routes under `/team/{team_id}/design` with
+    // their token (the owner's JWT works there as well, for the preview).
+
+    pub async fn select_designs(&self, project_id: Uuid) -> Result<DesignList, DesignError> {
+        let trace = TraceContext::new();
+        self.fetch_design_list(&trace, project_id).await
+    }
+
+    async fn fetch_design_list(
+        &self,
+        trace: &TraceContext,
+        project_id: Uuid,
+    ) -> Result<DesignList, DesignError> {
+        let response: DesignListResponse = self
+            .call_json(trace, Req::get(format!("{}/designs", project_path(project_id))))
+            .await
+            .map_err(design_error)?;
+        Ok(DesignList {
+            active: response.active,
+            designs: response
+                .data
+                .into_iter()
+                .map(|meta| DesignMeta {
+                    id: meta.id,
+                    name: meta.name,
+                    ratio: meta.ratio,
+                    revision: meta.revision,
+                    updated_at: to_naive(meta.updated_at),
+                    approx_bytes: meta.approx_bytes,
+                })
+                .collect(),
+        })
+    }
+
+    /// `GET` of a design. `if_none_match` is the `ETag` of the copy the caller already has.
+    async fn fetch_design_at(
+        &self,
+        trace: &TraceContext,
+        path: String,
+        auth: Auth,
+        if_none_match: Option<&str>,
+    ) -> Result<DesignFetch, DesignError> {
+        let mut req = Req::get(path).auth(auth);
+        if let Some(etag) = if_none_match {
+            req = req.header("If-None-Match", etag);
+        }
+        let response = self.execute(trace, &req).await.map_err(design_error)?;
+        if response.status() == StatusCode::NOT_MODIFIED {
+            return Ok(DesignFetch::NotModified);
+        }
+        if !response.status().is_success() {
+            return Err(design_error(ApiError::from_response(response).await));
+        }
+        let etag = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let text = response
+            .text()
+            .await
+            .map_err(|e| DesignError::other(format!("Response could not be read: {e}")))?;
+        let design = design_wire::from_wire(&text).map_err(DesignError::other)?;
+        Ok(DesignFetch::Modified(LoadedDesign { design, etag }))
+    }
+
+    /// The design as the owner stored it, without pictures (their `data_url` is empty).
+    #[allow(dead_code)] // part of the design API; the editor goes through `save_design`/`load_*`
+    pub async fn select_design(
+        &self,
+        project_id: Uuid,
+        design_id: Uuid,
+        if_none_match: Option<&str>,
+    ) -> Result<DesignFetch, DesignError> {
+        let trace = TraceContext::new();
+        self.fetch_design_at(
+            &trace,
+            format!("{}/design/{}", project_path(project_id), design_id),
+            Auth::Bearer,
+            if_none_match,
+        )
+        .await
+    }
+
+    async fn fetch_image_at(
+        &self,
+        trace: &TraceContext,
+        path: String,
+        auth: Auth,
+    ) -> Result<ImageData, DesignError> {
+        let response = self
+            .call(trace, Req::get(path).auth(auth))
+            .await
+            .map_err(design_error)?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_string();
+        let sha256 = response
+            .headers()
+            .get("etag")
+            .and_then(|value| value.to_str().ok())
+            .map(|etag| etag.trim().trim_start_matches("W/").trim_matches('"').to_string())
+            .filter(|etag| !etag.is_empty());
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| DesignError::other(format!("The picture could not be read: {e}")))?
+            .to_vec();
+        Ok(ImageData { bytes, content_type, sha256 })
+    }
+
+    #[allow(dead_code)] // part of the design API; the editor goes through `save_design`/`load_*`
+    pub async fn select_design_image(
+        &self,
+        project_id: Uuid,
+        image_id: Uuid,
+    ) -> Result<ImageData, DesignError> {
+        let trace = TraceContext::new();
+        self.fetch_image_at(
+            &trace,
+            format!("{}/design_image/{}", project_path(project_id), image_id),
+            Auth::Bearer,
+        )
+        .await
+    }
+
+    /// Stores a picture. Repeating it with the same id and bytes is fine (same answer).
+    #[allow(dead_code)] // part of the design API; the editor goes through `save_design`/`load_*`
+    pub async fn upload_design_image(
+        &self,
+        project_id: Uuid,
+        image_id: Uuid,
+        bytes: Vec<u8>,
+    ) -> Result<RemoteImage, DesignError> {
+        let trace = TraceContext::new();
+        self.upload_image(&trace, project_id, image_id, bytes).await
+    }
+
+    async fn upload_image(
+        &self,
+        trace: &TraceContext,
+        project_id: Uuid,
+        image_id: Uuid,
+        bytes: Vec<u8>,
+    ) -> Result<RemoteImage, DesignError> {
+        if bytes.len() > design_wire::MAX_IMAGE_BYTES {
+            return Err(DesignError::new(
+                DesignErrorKind::TooLarge,
+                "A picture is larger than 2 MiB. Use a smaller picture.",
+            ));
+        }
+        let response = self
+            .call(
+                trace,
+                Req::post(format!("{}/design_image/{}", project_path(project_id), image_id))
+                    .raw(bytes),
+            )
+            .await
+            .map_err(design_error)?;
+        let text = response
+            .text()
+            .await
+            .map_err(|e| DesignError::other(format!("Response could not be read: {e}")))?;
+        design_wire::remote_from_upload_answer(&text).map_err(DesignError::other)
+    }
+
+    pub async fn delete_design(&self, project_id: Uuid, design_id: Uuid) -> Result<(), DesignError> {
+        let trace = TraceContext::new();
+        self.call_unit(
+            &trace,
+            Req::delete(format!("{}/design/{}", project_path(project_id), design_id)),
+        )
+        .await
+        .map_err(design_error)?;
+        design::forget_design(&design::cache_key_owner(project_id, design_id));
+        Ok(())
+    }
+
+    /// The design the teams see; `None` shows them nothing (the classic sheet).
+    pub async fn set_active_design(
+        &self,
+        project_id: Uuid,
+        design_id: Option<Uuid>,
+    ) -> Result<(), DesignError> {
+        let trace = TraceContext::new();
+        let body = ActiveDesignRequest { design_id };
+        self.call_unit(
+            &trace,
+            Req::patch(format!("{}/active_design", project_path(project_id)))
+                .json(&body)
+                .map_err(DesignError::other)?,
+        )
+        .await
+        .map_err(design_error)
+    }
+
+    /// Saves a design: first the pictures that are not in the project yet, then the design
+    /// itself (`POST` if `etag` is `None`, otherwise `PATCH` with `If-Match`). Returns the new
+    /// `ETag`. `design` is updated with what the backend told about the pictures; a picture whose
+    /// id is taken by a different picture gets a new id.
+    pub async fn save_design(
+        &self,
+        project_id: Uuid,
+        design_id: Uuid,
+        design: &mut ScheduleDesign,
+        etag: Option<&str>,
+    ) -> Result<String, DesignError> {
+        let trace = TraceContext::new();
+        design.sanitize();
+        design_wire::validate(design).map_err(|e| DesignError::new(DesignErrorKind::Invalid, e))?;
+
+        // 1. Pictures first. One at a time: the backend decodes only two at once per pod.
+        let pending: Vec<Uuid> = design
+            .images
+            .iter()
+            .filter(|image| image.builtin_key().is_none() && image.remote.is_none())
+            .map(|image| image.id)
+            .collect();
+        for original in pending {
+            let mut id = original;
+            let image = design
+                .images
+                .iter()
+                .find(|image| image.id == id)
+                .cloned()
+                .ok_or_else(|| DesignError::other("A picture of the design disappeared"))?;
+            let (bytes, _) = design::data_url_to_bytes(&image.data_url).map_err(|_| {
+                DesignError::new(
+                    DesignErrorKind::Invalid,
+                    format!("images: the picture \"{}\" is not available. Remove it or add it again.", image.name),
+                )
+            })?;
+            let mut attempts = 0;
+            loop {
+                match self.upload_image(&trace, project_id, id, bytes.clone()).await {
+                    Ok(remote) => {
+                        if let Some(entry) = design.images.iter_mut().find(|entry| entry.id == id) {
+                            entry.remote = Some(remote);
+                        }
+                        break;
+                    }
+                    // The id belongs to a different picture: take a new one, rewrite the uses.
+                    Err(e) if e.is(DesignErrorKind::ImageIdTaken) && attempts < 2 => {
+                        attempts += 1;
+                        let new_id = Uuid::new_v4();
+                        design.reassign_image_id(id, new_id);
+                        id = new_id;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // 2. The design.
+        let body = design_wire::to_wire(design).map_err(|e| DesignError::new(DesignErrorKind::Invalid, e))?;
+        let path = format!("{}/design/{}", project_path(project_id), design_id);
+        let new_etag = match etag {
+            None => {
+                self.call_unit(&trace, Req::post(path.clone()).json_text(body))
+                    .await
+                    .map_err(design_error)?;
+                None
+            }
+            Some(etag) => {
+                let response = self
+                    .call(&trace, Req::patch(path.clone()).json_text(body).header("If-Match", etag))
+                    .await
+                    .map_err(design_error)?;
+                response
+                    .headers()
+                    .get("etag")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string)
+            }
+        };
+        design::forget_design(&design::cache_key_owner(project_id, design_id));
+        match new_etag {
+            Some(etag) => Ok(etag),
+            // A new design (or an answer without the header): ask for it.
+            None => match self.fetch_design_at(&trace, path, Auth::Bearer, None).await? {
+                DesignFetch::Modified(LoadedDesign { etag: Some(etag), .. }) => Ok(etag),
+                _ => Err(DesignError::other("The backend sent no ETag for the saved design")),
+            },
+        }
+    }
+
+    /// Loads the pictures of `design` (the ones that are stored in the cloud) into `data_url`.
+    /// Returns how many could not be loaded.
+    async fn fill_images(
+        &self,
+        trace: &TraceContext,
+        source: ImageSource<'_>,
+        design: &mut ScheduleDesign,
+        mode: ImageMode,
+    ) -> usize {
+        let wanted: Vec<(Uuid, RemoteImage)> = design
+            .images
+            .iter()
+            .filter_map(|image| image.remote.clone().map(|remote| (image.id, remote)))
+            .collect();
+        let mut missing = 0;
+        for (id, remote) in wanted {
+            let known = (mode == ImageMode::Blob)
+                .then(|| design::cached_blob_url(&remote.sha256))
+                .flatten();
+            let url = match known {
+                Some(url) => Some(url),
+                None => {
+                    let path = match source {
+                        ImageSource::Owner(project_id) => {
+                            format!("{}/design_image/{}", project_path(project_id), id)
+                        }
+                        ImageSource::Team(project_id, team_id, _) => {
+                            format!("{}/design/images/{}", team_path(project_id, team_id), id)
+                        }
+                    };
+                    let auth = match source {
+                        ImageSource::Owner(_) => Auth::Bearer,
+                        ImageSource::Team(_, _, access) => auth_for(access),
+                    };
+                    match self.fetch_image_at(trace, path, auth).await {
+                        Ok(data) => {
+                            let sha = data.sha256.clone().unwrap_or_else(|| remote.sha256.clone());
+                            match mode {
+                                ImageMode::Blob => {
+                                    design::blob_url(&data.bytes, &data.content_type, &sha).ok()
+                                }
+                                ImageMode::Data => {
+                                    Some(design::bytes_to_data_url(&data.bytes, &data.content_type))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            console::warn_1(&format!("Design picture {id} could not be loaded: {e}").into());
+                            None
+                        }
+                    }
+                }
+            };
+            match url {
+                Some(url) => {
+                    if let Some(image) = design.images.iter_mut().find(|image| image.id == id) {
+                        image.data_url = url;
+                    }
+                }
+                None => missing += 1,
+            }
+        }
+        missing
+    }
+
+    /// One design of the owner with its pictures (for reloading after a conflict).
+    pub async fn load_design(
+        &self,
+        project_id: Uuid,
+        design_id: Uuid,
+        mode: ImageMode,
+    ) -> Result<(CloudDesign, usize), DesignError> {
+        let trace = TraceContext::new();
+        let path = format!("{}/design/{}", project_path(project_id), design_id);
+        match self.fetch_design_at(&trace, path, Auth::Bearer, None).await? {
+            DesignFetch::Modified(mut loaded) => {
+                let missing = self
+                    .fill_images(&trace, ImageSource::Owner(project_id), &mut loaded.design, mode)
+                    .await;
+                Ok((CloudDesign { id: design_id, etag: loaded.etag, design: loaded.design }, missing))
+            }
+            DesignFetch::NotModified => Err(DesignError::other("Unexpected answer: not modified")),
+        }
+    }
+
+    /// Every design of the project with its pictures, and which one is active.
+    pub async fn load_design_library(
+        &self,
+        project_id: Uuid,
+        mode: ImageMode,
+    ) -> Result<CloudLibrary, DesignError> {
+        let trace = TraceContext::new();
+        let list = self.fetch_design_list(&trace, project_id).await?;
+        let mut library = CloudLibrary { active: list.active, ..CloudLibrary::default() };
+        for meta in list.designs {
+            let path = format!("{}/design/{}", project_path(project_id), meta.id);
+            match self.fetch_design_at(&trace, path, Auth::Bearer, None).await {
+                Ok(DesignFetch::Modified(mut loaded)) => {
+                    library.missing_images += self
+                        .fill_images(&trace, ImageSource::Owner(project_id), &mut loaded.design, mode)
+                        .await;
+                    library.designs.push(CloudDesign {
+                        id: meta.id,
+                        etag: loaded.etag,
+                        design: loaded.design,
+                    });
+                }
+                // Deleted since the list was read.
+                Err(e) if e.is(DesignErrorKind::NotFound) => {}
+                Ok(DesignFetch::NotModified) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if library.active.is_some_and(|id| library.designs.iter().all(|design| design.id != id)) {
+            library.active = None;
+        }
+        Ok(library)
+    }
+
+    /// The design the teams see, for the owner's own view of the plan. `None` if none is active.
+    pub async fn load_active_design(
+        &self,
+        project_id: Uuid,
+    ) -> Result<Option<ScheduleDesign>, DesignError> {
+        let trace = TraceContext::new();
+        let list = self.fetch_design_list(&trace, project_id).await?;
+        let Some(design_id) = list.active else { return Ok(None) };
+        let key = design::cache_key_owner(project_id, design_id);
+        let cached = design::cached_design(&key);
+        let path = format!("{}/design/{}", project_path(project_id), design_id);
+        match self
+            .fetch_design_at(&trace, path, Auth::Bearer, cached.as_ref().map(|(etag, _)| etag.as_str()))
+            .await
+        {
+            Ok(DesignFetch::NotModified) => Ok(cached.map(|(_, design)| design)),
+            Ok(DesignFetch::Modified(mut loaded)) => {
+                self.fill_images(&trace, ImageSource::Owner(project_id), &mut loaded.design, ImageMode::Blob)
+                    .await;
+                if let Some(etag) = &loaded.etag {
+                    design::remember_design(&key, etag, &loaded.design);
+                }
+                Ok(Some(loaded.design))
+            }
+            Err(e) if e.is(DesignErrorKind::NotFound) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The design a team sees: the active one. `Ok(None)` if there is none (`404`); a team that
+    /// canceled gets `DesignErrorKind::TeamCanceled`. Sends the `ETag` of the last copy.
+    pub async fn load_team_design(
+        &self,
+        project_id: Uuid,
+        team_id: Uuid,
+        access: &TeamAccess,
+    ) -> Result<Option<ScheduleDesign>, DesignError> {
+        let trace = TraceContext::new();
+        let key = design::cache_key_team(project_id, team_id);
+        let cached = design::cached_design(&key);
+        let path = format!("{}/design", team_path(project_id, team_id));
+        match self
+            .fetch_design_at(&trace, path, auth_for(access), cached.as_ref().map(|(etag, _)| etag.as_str()))
+            .await
+        {
+            Ok(DesignFetch::NotModified) => match cached {
+                Some((_, design)) => Ok(Some(design)),
+                None => Err(DesignError::other("Unexpected answer: not modified")),
+            },
+            Ok(DesignFetch::Modified(mut loaded)) => {
+                self.fill_images(
+                    &trace,
+                    ImageSource::Team(project_id, team_id, access),
+                    &mut loaded.design,
+                    ImageMode::Blob,
+                )
+                .await;
+                if let Some(etag) = &loaded.etag {
+                    design::remember_design(&key, etag, &loaded.design);
+                }
+                Ok(Some(loaded.design))
+            }
+            Err(e) if e.is(DesignErrorKind::NotFound) => {
+                design::forget_design(&key);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1376,7 +2081,7 @@ impl Storage for CloudStorage {
     }
 
     async fn select_cook_and_run(&self, id: Uuid) -> Result<CookAndRunData, String> {
-        // One trace for the whole composite load: metadata, courses, teams (+notes), points, plan, plan config.
+        // One trace for the whole composite load: metadata, courses, teams (+notes), points, plan.
         let trace = TraceContext::new();
         let meta = self.fetch_meta(&trace, id).await?;
         let course_list = self.fetch_courses(&trace, id).await?;
@@ -1388,7 +2093,6 @@ impl Storage for CloudStorage {
             .fetch_point(&trace, id, "end_point", "Ending point")
             .await?;
         let top_plan = self.fetch_plan(&trace, id).await?;
-        let plan_config = self.fetch_plan_config(&trace, id).await?;
 
         Ok(CookAndRunData {
             id: meta.id,
@@ -1403,7 +2107,6 @@ impl Storage for CloudStorage {
             start_point,
             end_point,
             top_plan,
-            plan_config,
         })
     }
 
@@ -1635,6 +2338,7 @@ impl Storage for CloudStorage {
             phone: &team.phone,
             members: &team.members,
             diets: &team.diets,
+            honeypot: None,
         };
         self.call_unit(
             &trace,
@@ -1777,43 +2481,59 @@ impl Storage for CloudStorage {
         .await?;
         Ok(())
     }
+}
 
-    // ----- plan config -----------------------------------------------------------------------
+#[cfg(test)]
+mod auth_tests {
+    use super::*;
 
-    async fn select_plan_config_of_cook_and_run(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Option<PlanConfigData>, String> {
-        let trace = TraceContext::new();
-        self.fetch_plan_config(&trace, cook_and_run_id).await
+    #[test]
+    fn a_guest_needs_no_login_for_the_public_share_config() {
+        // The registration page of the share link has no session: nothing may be required.
+        assert_eq!(bearer_token(&Auth::Anonymous, None), Ok(None));
     }
 
-    async fn update_plan_config_of_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-        plan_config: &PlanConfigData,
-    ) -> Result<(), String> {
-        plan_config.validate()?;
-        let trace = TraceContext::new();
-        self.call_unit(
-            &trace,
-            Req::patch(format!("{}/plan_config", project_path(cook_and_run_id)))
-                .json(plan_config)?,
-        )
-        .await?;
-        Ok(())
+    #[test]
+    fn the_public_share_config_has_its_own_path() {
+        let project = Uuid::from_u128(1);
+        let path = public_share_config_path(project);
+        assert!(path.ends_with("/share_team_config/public"), "{path}");
+        assert!(path.starts_with(&project_path(project)), "{path}");
     }
 
-    async fn delete_plan_config_of_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-    ) -> Result<(), String> {
-        let trace = TraceContext::new();
-        self.call_unit(
-            &trace,
-            Req::delete(format!("{}/plan_config", project_path(cook_and_run_id))),
-        )
-        .await?;
-        Ok(())
+    #[test]
+    fn the_public_share_config_parses_without_the_organizer_flags() {
+        let body = r#"{
+            "project_name": "Dinner",
+            "invite_text": "Hi",
+            "require_email_verification": true,
+            "default_needs_check": false,
+            "required_fields": ["mail", "diets"],
+            "max_teams": 12,
+            "registration_deadline": "2026-12-01T10:00:00Z",
+            "edit_deadline": null,
+            "review_trigger_fields": ["members"],
+            "created": "2026-11-01T08:30:00Z"
+        }"#;
+        let config = serde_json::from_str::<PublicShareConfigResponse>(body).unwrap().into_config();
+        assert_eq!(config.invite_text, "Hi");
+        assert!(config.require_email_verification && !config.default_needs_check);
+        assert_eq!(config.required_fields, vec![RequiredField::Mail, RequiredField::Diets]);
+        assert_eq!(config.review_trigger_fields, vec![RequiredField::Members]);
+        assert_eq!(config.max_teams, Some(12));
+        assert!(config.registration_deadline.is_some() && config.edit_deadline.is_none());
+        assert!(!config.notify_admin_on_review && !config.notify_admin_on_create && !config.notify_admin_on_cancel);
+    }
+
+    #[test]
+    fn owner_requests_still_need_a_login() {
+        assert_eq!(bearer_token(&Auth::Bearer, None), Err("No auth data!"));
+        assert_eq!(bearer_token(&Auth::Bearer, Some("jwt".into())), Ok(Some("jwt".to_string())));
+    }
+
+    #[test]
+    fn team_token_and_anonymous_requests_never_send_the_bearer_token() {
+        assert_eq!(bearer_token(&Auth::Token("t".into()), Some("jwt".into())), Ok(None));
+        assert_eq!(bearer_token(&Auth::Anonymous, Some("jwt".into())), Ok(None));
     }
 }

@@ -44,7 +44,7 @@ pub fn ShareRegisterPage(cook_and_run_id: ReadSignal<Uuid>) -> Element {
             let base_url = config
                 .peek()
                 .as_ref()
-                .map(|config| config.auth.audience.clone())
+                .map(|config| config.api_base_url())
                 .ok_or_else(|| "The configuration is not loaded.".to_string())?;
             storage.connect_cloud_anonymous(base_url).await?;
             storage.read().await.select_cook_and_run_share_config(id).await

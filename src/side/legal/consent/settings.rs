@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use crate::ui::{Button, ButtonVariant, Notice, NoticeTone, Panel, Switch};
 
 use crate::{
     config::Config,
@@ -26,21 +27,7 @@ pub fn CookieSettings() -> Element {
     rsx! {
         LegalPageShell { title: "Cookie-Einstellungen".to_string(),
             if consent_given && consent_enabled {
-                div {
-                    class: "flex items-center gap-2.5 px-4 py-3 \
-                            rounded-xl bg-amber-50 border border-amber-200/70 text-sm",
-                    svg {
-                        class: "w-4 h-4 shrink-0 text-amber-600",
-                        fill: "none", xmlns: "http://www.w3.org/2000/svg",
-                        view_box: "0 0 24 24", stroke: "currentColor", stroke_width: "2",
-                        path { stroke_linecap: "round", stroke_linejoin: "round",
-                            d: "M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
-                        }
-                    }
-                    span { class: "text-amber-800 text-xs",
-                        "Ihre Einstellungen wurden gespeichert."
-                    }
-                }
+                Notice { tone: NoticeTone::Success, small: true, roomy: true, "Ihre Einstellungen wurden gespeichert." }
             }
 
             LegalSection { title: "Über Cookies".to_string(),
@@ -84,11 +71,11 @@ pub fn CookieSettings() -> Element {
                     if consent_enabled {
                         div { class: "shrink-0 flex items-center gap-2 mt-0.5",
                             span { class: "text-xs text-zinc-400", "Immer aktiv" }
-                            div {
-                                class: "w-10 h-5 rounded-full bg-amber-300/60 \
-                                        flex items-center px-0.5 cursor-not-allowed",
-                                title: "Notwendige Cookies können nicht deaktiviert werden",
-                                div { class: "w-4 h-4 rounded-full bg-amber-600/70 ml-auto" }
+                            Switch {
+                                label: "Notwendige Cookies können nicht deaktiviert werden",
+                                on: true,
+                                disabled: true,
+                                onchange: move |_| {},
                             }
                         }
                     }
@@ -110,41 +97,22 @@ pub fn CookieSettings() -> Element {
                             span { class: "text-xs text-zinc-500",
                                 if current_analytics { "Aktiv" } else { "Inaktiv" }
                             }
-                            button {
-                                class: {
-                                    let base = "w-10 h-5 rounded-full flex items-center \
-                                                px-0.5 transition-colors duration-200 cursor-pointer";
-                                    if current_analytics {
-                                        format!("{base} bg-amber-500")
-                                    } else {
-                                        format!("{base} bg-zinc-300")
-                                    }
-                                },
-                                onclick: {
+                            Switch {
+                                label: "Analyse-Cookies",
+                                on: current_analytics,
+                                onchange: {
                                     let v = version.clone();
-                                    move |_| {
-                                        let current = consent.read().clone();
+                                    move |on: bool| {
                                         let updated = ConsentState {
                                             consent_given: true,
                                             timestamp: ConsentState::accept_all(&v).timestamp,
                                             version: v.clone(),
-                                            analytics_allowed: !current.analytics_allowed,
+                                            analytics_allowed: on,
                                         };
                                         updated.save();
                                         consent.set(updated);
                                     }
                                 },
-                                div {
-                                    class: {
-                                        let base = "w-4 h-4 rounded-full bg-white \
-                                                    shadow-sm transition-all duration-200";
-                                        if current_analytics {
-                                            format!("{base} ml-auto")
-                                        } else {
-                                            format!("{base}")
-                                        }
-                                    }
-                                }
                             }
                         }
                     }
@@ -181,17 +149,13 @@ pub fn CookieSettings() -> Element {
                          widerrufen. Dies berührt nicht die Rechtmäßigkeit der bis zum \
                          Widerruf erfolgten Verarbeitung."
                     }
-                    button {
-                        class: "shrink-0 px-4 py-2 rounded-xl text-sm font-medium \
-                                border border-red-300 text-red-600 \
-                                hover:bg-red-50 transition-colors duration-150 cursor-pointer",
+                    Button {
+                        label: "Einwilligung widerrufen",
+                        variant: ButtonVariant::DangerOutline,
                         onclick: {
                             let v = version.clone();
-                            move |_| {
-                                consent.set(ConsentState::reset(&v));
-                            }
+                            move |_| consent.set(ConsentState::reset(&v))
                         },
-                        "Einwilligung widerrufen"
                     }
                 }
             }
@@ -210,7 +174,7 @@ struct CookieEntryProps {
 #[component]
 fn CookieEntry(props: CookieEntryProps) -> Element {
     rsx! {
-        div { class: "flex flex-col gap-0.5 p-2.5 rounded-lg bg-zinc-50 border border-zinc-100",
+        Panel { flush: true, class: "flex flex-col gap-0.5 p-2.5",
             div { class: "flex items-center gap-2",
                 span { class: "text-xs font-semibold text-zinc-700", "{props.name}" }
                 span {

@@ -27,10 +27,9 @@ use crate::config::Config;
 use crate::data::Storage;
 use crate::storage::StorageManager;
 use crate::web::origin;
-use crate::Route;
 
 pub use register::ShareRegisterPage;
-pub use team::{TeamPage, TeamVerifyPage};
+pub use team::{TeamDeepLink, TeamPage, TeamVerifyPage};
 
 /// The participant's own storage. Call [`use_participant`] in the page component and
 /// [`Participant::connect`] at the start of every resource that talks to the backend.
@@ -63,29 +62,35 @@ impl Participant {
             .config
             .peek()
             .as_ref()
-            .map(|config| config.auth.audience.clone())
+            .map(|config| config.api_base_url())
             .ok_or_else(|| "The configuration is not loaded.".to_string())?;
         storage.connect_cloud_anonymous(base_url).await?;
         Ok(storage)
     }
 }
 
-/// Personal link of a team (`https://host/cook-and-run/{id}/team/{team}/{token}`). The token is the
-/// team's only credential: anybody with the link can edit or cancel the team.
+/// Personal link of a team, in the shape the API mails it (`…/project/{id}/team/{team}#token=…`).
+/// The token is the team's only credential: anybody with the link can edit, cancel or delete the
+/// team. Older links of the form `/cook-and-run/{id}/team/{team}/{token}` keep working.
 pub fn team_url(cook_and_run_id: Uuid, team_id: Uuid, access_token: Uuid) -> String {
-    format!(
-        "{}{}",
-        origin().unwrap_or_default(),
-        Route::TeamPage { cook_and_run_id, team_id, access_token }
-    )
+    crate::deeplink::team_link(&origin().unwrap_or_default(), cook_and_run_id, team_id, access_token)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Route;
 
     #[test]
-    fn team_links_carry_the_ids_and_the_token_in_the_path() {
+    fn the_new_link_opens_the_team_page_and_keeps_the_token_out_of_the_path() {
+        let (project, team) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let url = Route::TeamDeepLink { cook_and_run_id: project, team_id: team }.to_string();
+        assert_eq!(url, format!("/project/{project}/team/{team}"));
+        assert!(url.parse::<Route>().ok() == Some(Route::TeamDeepLink { cook_and_run_id: project, team_id: team }));
+    }
+
+    #[test]
+    fn the_old_path_links_still_resolve() {
         let (project, team, token) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         let url = Route::TeamPage { cook_and_run_id: project, team_id: team, access_token: token }.to_string();
         assert_eq!(url, format!("/cook-and-run/{project}/team/{team}/{token}"));

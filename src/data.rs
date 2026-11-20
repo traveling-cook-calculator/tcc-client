@@ -97,6 +97,11 @@ impl Storage {
         result
     }
 
+    /// Gives the open cloud connection a renewed token. Does not invalidate: nothing in the data changed.
+    pub async fn update_session(&self, auth: AuthState) {
+        self.write().await.update_cloud_session(auth);
+    }
+
     pub async fn disconnect_cloud(&self) {
         self.write().await.disconnect_cloud();
         self.invalidate();

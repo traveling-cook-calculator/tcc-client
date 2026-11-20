@@ -1,9 +1,13 @@
 pub(crate) mod address;
 pub mod calculate;
 pub mod courses;
+pub mod design_notice;
 pub mod overview;
 pub mod plan;
+pub(crate) mod plan_editor;
+pub(crate) mod plan_bundle;
 pub(crate) mod run_schedule;
+pub mod schedules;
 pub mod startend;
 pub mod teams;
 
@@ -23,10 +27,11 @@ pub fn Menu(cook_and_run_id: Uuid) -> Element {
     // (label, target). Order = order in the menu.
     let items = [
         ("Overview", Route::Overview { cook_and_run_id }),
-        ("Teams", Route::Teams { cook_and_run_id }),
+        ("Teams", Route::Teams { cook_and_run_id, team: String::new() }),
         ("Start & End", Route::StartEnd { cook_and_run_id }),
         ("Courses", Route::Courses { cook_and_run_id }),
         ("Calculation", Route::Calculate { cook_and_run_id }),
+        ("Schedules", Route::Schedules { cook_and_run_id }),
     ];
 
     rsx! {
@@ -56,7 +61,7 @@ fn is_active(target: &Route, current: &Route) -> bool {
     target == current
         || matches!(
             (target, current),
-            (Route::Teams { .. }, Route::Plan { .. })
+            (Route::Teams { .. }, Route::Plan { .. } | Route::Teams { .. })
         )
 }
 

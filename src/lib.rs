@@ -1,4 +1,10 @@
 pub mod keycloak;
 pub mod calculator;
 pub mod config;
+pub mod deeplink;
 pub mod storage;
+pub mod design_geometry;
+pub mod design_wire;
+pub mod planning;
+pub mod schedule_design;
+pub mod schedule_text;

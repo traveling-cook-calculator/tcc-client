@@ -14,6 +14,7 @@ mod dialogs;
 mod draft;
 mod filter;
 mod form;
+mod history;
 mod notes;
 mod share;
 
@@ -41,7 +42,7 @@ struct TeamsData {
 }
 
 #[component]
-pub fn Teams(cook_and_run_id: ReadSignal<Uuid>) -> Element {
+pub fn Teams(cook_and_run_id: ReadSignal<Uuid>, team: ReadSignal<String>) -> Element {
     let storage = use_storage();
     let data = use_resource(move || {
         let id = cook_and_run_id();
@@ -60,10 +61,12 @@ pub fn Teams(cook_and_run_id: ReadSignal<Uuid>) -> Element {
     });
 
     let id = cook_and_run_id();
+    // From the link in a notification mail: the dialog of this team opens right away.
+    let focus = team().parse::<Uuid>().ok();
     render_resource(
         data,
         "Could not load project. You may need to log in or the servers may be offline.",
-        move |data| rsx! { TeamsContent { key: "{id}", cook_and_run_id: id, data } },
+        move |data| rsx! { TeamsContent { key: "{id}", cook_and_run_id: id, data, focus } },
     )
 }
 
@@ -78,8 +81,12 @@ enum Open {
 }
 
 #[component]
-fn TeamsContent(cook_and_run_id: Uuid, data: TeamsData) -> Element {
-    let mut open = use_signal(|| Open::Nothing);
+fn TeamsContent(cook_and_run_id: Uuid, data: TeamsData, focus: Option<Uuid>) -> Element {
+    // Only a team that exists in the list is opened; anything else leaves the page as it is.
+    let initial = focus
+        .filter(|id| data.teams.iter().any(|team| team.id == *id))
+        .map_or(Open::Nothing, Open::Edit);
+    let mut open = use_signal(move || initial);
     let mut search = use_signal(String::new);
     let mut sort = use_signal(TeamSort::default);
     let close = move |_| open.set(Open::Nothing);
@@ -90,12 +97,9 @@ fn TeamsContent(cook_and_run_id: Uuid, data: TeamsData) -> Element {
     let query = search.read().trim().to_string();
     let shown = visible_teams(&data.teams, &query, sort());
 
+    // Sharing exists only for cloud projects: for a local project the button is not shown at all.
     let share_button = match (&data.is_cloud, &data.share_config) {
-        (false, _) => rsx! {
-            span { title: "Sharing is only available when the project is stored in the cloud.",
-                Button { label: "Share", variant: ButtonVariant::Secondary, disabled: true, onclick: move |_| {} }
-            }
-        },
+        (false, _) => rsx! {},
         (true, Err(e)) => rsx! {
             span { title: "The share configuration could not be loaded: {e}",
                 Button { label: "Share", variant: ButtonVariant::Secondary, disabled: true, onclick: move |_| {} }
@@ -113,7 +117,11 @@ fn TeamsContent(cook_and_run_id: Uuid, data: TeamsData) -> Element {
             if data.teams.is_empty() {
                 EmptyState {
                     title: "No teams yet",
-                    text: "Add the teams that take part, or share a link so they can register themselves.",
+                    text: if data.is_cloud {
+                        "Add the teams that take part, or share a link so they can register themselves."
+                    } else {
+                        "Add the teams that take part."
+                    },
                     Button { label: "Add team", onclick: move |_| open.set(Open::Add) }
                 }
             } else {
@@ -279,11 +287,8 @@ fn TeamCard(team: TeamMetaData, show_verification: bool, onopen: EventHandler<()
     let diets = Presence::of(team.diets);
 
     rsx! {
-        button {
-            r#type: "button",
-            class: "w-full text-left relative bg-white rounded-2xl border {border} shadow-sm \
-                    hover:shadow-md transition-all duration-150 cursor-pointer overflow-hidden \
-                    focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400",
+        CardButton {
+            class: "{border}",
             onclick: move |_| onopen.call(()),
 
             div { class: "px-4 py-2.5 border-b flex items-center gap-2 {header}",

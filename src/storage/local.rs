@@ -5,7 +5,7 @@ use super::{CookAndRunData, CookAndRunMetaData};
 
 use crate::storage::{
     CookAndRunCreate, CookAndRunMetaUpdate, CourseCreate, CourseData, CourseUpdate,
-    MeetingPointData, NoteCreate, NoteData, PlanConfigData, PlanData, Storage, TeamCreate,
+    MeetingPointData, NoteCreate, NoteData, PlanData, Storage, TeamCreate,
     TeamData, TeamMetaData, TeamStatus, TeamUpdate, MAX_COURSES_PER_PROJECT, MAX_PROJECTS_PER_USER,
     MAX_TEAMS_PER_PROJECT,
 };
@@ -17,10 +17,85 @@ const DATA_KEY: &str = "tcc_data_v2";
 /// Local storage holds exactly what the backend can hold, restricted to what makes sense without a
 /// server: no share configuration, no access tokens, no audit log, no participant self-service,
 /// no email notifications and no plan "stale" tracking.
+///
+/// # Where the data lives
+/// In the browser's `localStorage`: it survives closing the tab, closing the browser and restarting
+/// the computer. (Until now the data was in `sessionStorage`, which the browser deletes as soon as
+/// the tab or browser is closed; existing session data is moved over, see `migrate_from_session`.)
+///
+/// # Several tabs
+/// `localStorage` is shared by all tabs of the app, but every tab keeps its own copy in memory.
+/// Every write therefore starts by re-reading the stored data (`reload`) and applies the change to
+/// that; otherwise a tab with an outdated copy would overwrite what another tab saved.
 #[derive(PartialEq, Clone, Debug)]
 pub struct LocalStorage {
     storage: web_sys::Storage,
     cook_and_run_data: Vec<CookAndRunData>,
+    /// Projects that are stored but cannot be read by this version of the app (e.g. written by a
+    /// newer version). They are not shown, but they are written back unchanged instead of being lost.
+    unreadable: Vec<serde_json::Value>,
+}
+
+/// Writes a warning to the browser console (nowhere else to put it; outside the browser, in tests, it goes to stderr).
+fn log_warning(message: String) {
+    #[cfg(target_arch = "wasm32")]
+    web_sys::console::warn_1(&message.into());
+    #[cfg(not(target_arch = "wasm32"))]
+    eprintln!("{message}");
+}
+
+/// What a stored JSON text contains.
+struct Parsed {
+    projects: Vec<CookAndRunData>,
+    unreadable: Vec<serde_json::Value>,
+}
+
+/// Reads the stored list project by project: one project that cannot be read must not make all
+/// the others unavailable (or, worse, be overwritten by the next save).
+fn parse_projects(raw: &str) -> Result<Parsed, String> {
+    let values: Vec<serde_json::Value> =
+        serde_json::from_str(raw).map_err(|e| format!("Data could not parse json: {}", e))?;
+    let mut parsed = Parsed { projects: Vec::new(), unreadable: Vec::new() };
+    for value in values {
+        match serde_json::from_value::<CookAndRunData>(value.clone()) {
+            Ok(project) => parsed.projects.push(project),
+            Err(e) => {
+                log_warning(format!("A stored project could not be read and is kept untouched: {e}"));
+                parsed.unreadable.push(value);
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// The JSON text that is stored: the readable projects followed by the unreadable ones.
+fn serialize_projects(
+    projects: &[CookAndRunData],
+    unreadable: &[serde_json::Value],
+) -> Result<String, String> {
+    let mut values = Vec::with_capacity(projects.len() + unreadable.len());
+    for project in projects {
+        values.push(
+            serde_json::to_value(project)
+                .map_err(|e| format!("Struct could not be parsed into json: {}", e))?,
+        );
+    }
+    values.extend(unreadable.iter().cloned());
+    serde_json::to_string(&values).map_err(|e| format!("Struct could not be parsed into json: {}", e))
+}
+
+/// Adds the projects of `incoming` that `projects` does not have yet (by id). Returns whether
+/// something was added. Existing projects always win: the data in `localStorage` is newer than
+/// what an old session left behind.
+fn merge_projects(projects: &mut Vec<CookAndRunData>, incoming: Vec<CookAndRunData>) -> bool {
+    let mut added = false;
+    for project in incoming {
+        if !projects.iter().any(|existing| existing.id == project.id) {
+            projects.push(project);
+            added = true;
+        }
+    }
+    added
 }
 
 impl CourseCreate {
@@ -90,25 +165,30 @@ impl LocalStorage {
         let window = web_sys::window().ok_or_else(|| "No global `window` exists".to_string())?;
 
         let storage = window
-            .session_storage()
+            .local_storage()
             .map_err(|e| {
                 format!(
-                    "Session storage could not be loaded: {}",
+                    "Local storage could not be loaded: {}",
                     e.as_string().unwrap_or_default()
                 )
             })?
-            .ok_or_else(|| "Session storage is not available".to_string())?;
+            .ok_or_else(|| "Local storage is not available".to_string())?;
 
-        let cook_and_run_data = Self::load_cook_and_run_data(&storage)
+        let parsed = Self::load_cook_and_run_data(&storage)
             .map_err(|e| format!("Cook and run data could not be loaded: {}", e))?;
 
-        Ok(LocalStorage {
+        let mut local = LocalStorage {
             storage,
-            cook_and_run_data,
-        })
+            cook_and_run_data: parsed.projects,
+            unreadable: parsed.unreadable,
+        };
+        if let Ok(Some(session)) = window.session_storage() {
+            local.migrate_from_session(&session);
+        }
+        Ok(local)
     }
 
-    fn load_cook_and_run_data(storage: &web_sys::Storage) -> Result<Vec<CookAndRunData>, String> {
+    fn load_cook_and_run_data(storage: &web_sys::Storage) -> Result<Parsed, String> {
         let data = storage
             .get_item(DATA_KEY)
             .map_err(|e| {
@@ -119,7 +199,42 @@ impl LocalStorage {
             })?
             .unwrap_or_else(|| "[]".to_string());
 
-        serde_json::from_str(&data).map_err(|e| format!("Data could not parse json: {}", e))
+        parse_projects(&data)
+    }
+
+    /// Re-reads the stored data. Called before every write (see the type docs: several tabs).
+    /// If the stored data cannot be read at all, nothing is written.
+    fn reload(&mut self) -> Result<(), String> {
+        let parsed = Self::load_cook_and_run_data(&self.storage)?;
+        self.cook_and_run_data = parsed.projects;
+        self.unreadable = parsed.unreadable;
+        Ok(())
+    }
+
+    /// One-time move of the data from the old `sessionStorage` location: projects that were only in
+    /// the session are added, then the session copy is removed. Nothing is removed unless the data
+    /// was stored successfully.
+    fn migrate_from_session(&mut self, session: &web_sys::Storage) {
+        let Ok(Some(raw)) = session.get_item(DATA_KEY) else { return };
+        let old = match parse_projects(&raw) {
+            Ok(old) => old,
+            Err(e) => {
+                log_warning(format!("Old session data was not migrated: {e}"));
+                return;
+            }
+        };
+        let added = merge_projects(&mut self.cook_and_run_data, old.projects);
+        if added {
+            if let Err(e) = self.persist() {
+                log_warning(format!("Old session data was not migrated: {e}"));
+                // Back to what is really stored; the session copy stays for the next attempt.
+                let _ = self.reload();
+                return;
+            }
+        }
+        if old.unreadable.is_empty() {
+            let _ = session.remove_item(DATA_KEY);
+        }
     }
 
     /// Cheap existence check (the storage manager uses it to decide between local and cloud).
@@ -136,12 +251,11 @@ impl LocalStorage {
 
     /// Writes the in-memory state to the browser storage.
     fn persist(&self) -> Result<(), String> {
-        let json = serde_json::to_string(&self.cook_and_run_data)
-            .map_err(|e| format!("Struct could not be parsed into json: {}", e))?;
+        let json = serialize_projects(&self.cook_and_run_data, &self.unreadable)?;
 
         self.storage.set_item(DATA_KEY, &json).map_err(|e| {
             format!(
-                "Data could not be stored: {}",
+                "Data could not be stored (is the browser storage full?): {}",
                 e.as_string().unwrap_or_default()
             )
         })
@@ -153,6 +267,7 @@ impl LocalStorage {
     where
         F: FnOnce(&mut CookAndRunData) -> Result<(), String>,
     {
+        self.reload()?;
         let index = self
             .cook_and_run_data
             .iter()
@@ -181,6 +296,7 @@ impl Storage for LocalStorage {
         cook_and_run: &CookAndRunCreate,
     ) -> Result<(), String> {
         cook_and_run.validate()?;
+        self.reload()?;
         if self.contains(cook_and_run_id) {
             return Err(format!(
                 "Cook and run project with ID {} already exists",
@@ -204,6 +320,7 @@ impl Storage for LocalStorage {
     }
 
     async fn delete_cook_and_run(&mut self, id: Uuid) -> Result<(), String> {
+        self.reload()?;
         let index = self
             .cook_and_run_data
             .iter()
@@ -583,44 +700,59 @@ impl Storage for LocalStorage {
             Ok(())
         })
     }
+}
 
-    // ----- plan config -----------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    async fn select_plan_config_of_cook_and_run(
-        &self,
-        cook_and_run_id: Uuid,
-    ) -> Result<Option<PlanConfigData>, String> {
-        Ok(self.get(cook_and_run_id)?.plan_config.clone())
+    fn project(n: u128, name: &str) -> CookAndRunData {
+        CookAndRunData::new(Uuid::from_u128(n), name.to_string())
     }
 
-    async fn update_plan_config_of_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-        plan_config: &PlanConfigData,
-    ) -> Result<(), String> {
-        plan_config.validate()?;
-        self.modify(cook_and_run_id, |project| {
-            let mut plan_config = plan_config.clone();
-            // Access via link/account only exists for plans in the cloud.
-            plan_config.access.clear();
-            project.plan_config = Some(plan_config);
-            Ok(())
-        })
+    #[test]
+    fn stored_text_round_trips() {
+        let projects = vec![project(1, "A"), project(2, "B")];
+        let json = serialize_projects(&projects, &[]).unwrap();
+        let parsed = parse_projects(&json).unwrap();
+        assert_eq!(parsed.projects, projects);
+        assert!(parsed.unreadable.is_empty());
     }
 
-    async fn delete_plan_config_of_cook_and_run(
-        &mut self,
-        cook_and_run_id: Uuid,
-    ) -> Result<(), String> {
-        self.modify(cook_and_run_id, |project| {
-            if project.plan_config.is_none() {
-                return Err(format!(
-                    "Plan config not found in Cook and Run project with ID {}",
-                    cook_and_run_id
-                ));
-            }
-            project.plan_config = None;
-            Ok(())
-        })
+    #[test]
+    fn one_unreadable_project_does_not_hide_or_destroy_the_others() {
+        let good = project(1, "Good");
+        let broken = serde_json::json!({ "id": "not-a-project", "unexpected": true });
+        let json = serde_json::to_string(&vec![serde_json::to_value(&good).unwrap(), broken.clone()]).unwrap();
+
+        let parsed = parse_projects(&json).unwrap();
+        assert_eq!(parsed.projects, vec![good.clone()]);
+        assert_eq!(parsed.unreadable, vec![broken.clone()]);
+
+        // Saving writes the unreadable project back untouched.
+        let saved = serialize_projects(&parsed.projects, &parsed.unreadable).unwrap();
+        let again = parse_projects(&saved).unwrap();
+        assert_eq!(again.projects, vec![good]);
+        assert_eq!(again.unreadable, vec![broken]);
+    }
+
+    #[test]
+    fn text_that_is_not_a_list_is_an_error_and_never_an_empty_list() {
+        assert!(parse_projects("{\"a\": 1}").is_err());
+        assert!(parse_projects("not json").is_err());
+        assert!(parse_projects("[]").unwrap().projects.is_empty());
+    }
+
+    #[test]
+    fn merging_adds_only_new_projects_and_keeps_existing_ones() {
+        let mut stored = vec![project(1, "Stored version")];
+        let added = merge_projects(&mut stored, vec![project(1, "Old session version"), project(2, "Only in session")]);
+        assert!(added);
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].name, "Stored version");
+        assert_eq!(stored[1].name, "Only in session");
+
+        assert!(!merge_projects(&mut stored, vec![project(2, "Again")]));
+        assert_eq!(stored.len(), 2);
     }
 }

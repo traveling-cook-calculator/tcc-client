@@ -190,3 +190,17 @@ pub fn Dialog(
         }
     }
 }
+
+/// A soft inset box inside a card: a group of related settings, a QR code, a status block.
+/// `flush` removes the padding when the content brings its own (rows with dividers).
+#[component]
+pub fn Panel(
+    #[props(default)] flush: bool,
+    #[props(default, into)] class: String,
+    children: Element,
+) -> Element {
+    let pad = if flush { "" } else { "p-4" };
+    rsx! {
+        div { class: "rounded-xl border border-amber-100 bg-amber-50/30 {pad} {class}", {children} }
+    }
+}

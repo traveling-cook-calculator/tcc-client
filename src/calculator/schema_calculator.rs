@@ -74,7 +74,6 @@ impl Schema {
         (1..=size).all(|team| (0..3).all(|rank| attendance.get(&(team, rank)) == Some(&1)))
     }
 
-
     fn create_mapping(&self, sorted_team_list: &Vec<&Team>) -> HashMap<u8, Uuid> {
         let mut mapping = HashMap::new();
 
@@ -525,11 +524,11 @@ impl<'a> SchemaCalculator<'a> {
                                 },
                             ),
                             (
-                                3,
+                                2,
                                 SchemaCourse {
                                     course_type: CourseType::MainCourse,
-                                    host: 3,
-                                    guest_list: vec![6, 10],
+                                    host: 2,
+                                    guest_list: vec![6, 10, 13],
                                 },
                             ),
                             (
@@ -553,15 +552,7 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::MainCourse,
                                     host: 11,
-                                    guest_list: vec![3],
-                                },
-                            ),
-                            (
-                                14,
-                                SchemaCourse {
-                                    course_type: CourseType::MainCourse,
-                                    host: 14,
-                                    guest_list: vec![7],
+                                    guest_list: vec![3, 7],
                                 },
                             ),
                             (
@@ -577,7 +568,7 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::Dessert,
                                     host: 6,
-                                    guest_list: vec![1, 8, 13],
+                                    guest_list: vec![1, 8],
                                 },
                             ),
                             (
@@ -585,7 +576,7 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::Dessert,
                                     host: 9,
-                                    guest_list: vec![4, 11, 14],
+                                    guest_list: vec![4, 11],
                                 },
                             ),
                             (
@@ -593,7 +584,15 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::Dessert,
                                     host: 12,
-                                    guest_list: vec![7, 2],
+                                    guest_list: vec![7],
+                                },
+                            ),
+                            (
+                                13,
+                                SchemaCourse {
+                                    course_type: CourseType::Dessert,
+                                    host: 13,
+                                    guest_list: vec![2],
                                 },
                             ),
                         ]),
@@ -632,14 +631,22 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::Appetizer,
                                     host: 10,
-                                    guest_list: vec![11, 12, 13],
+                                    guest_list: vec![11, 12],
                                 },
                             ),
                             (
-                                3,
+                                13,
+                                SchemaCourse {
+                                    course_type: CourseType::Appetizer,
+                                    host: 13,
+                                    guest_list: vec![14],
+                                },
+                            ),
+                            (
+                                2,
                                 SchemaCourse {
                                     course_type: CourseType::MainCourse,
-                                    host: 3,
+                                    host: 2,
                                     guest_list: vec![6, 10],
                                 },
                             ),
@@ -664,14 +671,14 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::MainCourse,
                                     host: 11,
-                                    guest_list: vec![3],
+                                    guest_list: vec![3, 13],
                                 },
                             ),
                             (
-                                13,
+                                14,
                                 SchemaCourse {
                                     course_type: CourseType::MainCourse,
-                                    host: 13,
+                                    host: 14,
                                     guest_list: vec![7],
                                 },
                             ),
@@ -680,7 +687,7 @@ impl<'a> SchemaCalculator<'a> {
                                 SchemaCourse {
                                     course_type: CourseType::Dessert,
                                     host: 3,
-                                    guest_list: vec![10, 5],
+                                    guest_list: vec![10, 5, 14],
                                 },
                             ),
                             (
@@ -1131,8 +1138,15 @@ impl<'a> SchemaCalculator<'a> {
         let team_count = self.team_list.len();
         let groups = team_count / 9;
         for index in 0..groups {
-            let size = if index == groups - 1 { 9 + team_count % 9 } else { 9 } as u8;
-            let supported = self.schema_list.get(&size).is_some_and(|schema| schema.is_consistent(size));
+            let size = if index == groups - 1 {
+                9 + team_count % 9
+            } else {
+                9
+            } as u8;
+            let supported = self
+                .schema_list
+                .get(&size)
+                .is_some_and(|schema| schema.is_consistent(size));
             if !supported {
                 return Err(format!(
                     "With {team_count} teams one group would have {size} teams, and the plan schema \

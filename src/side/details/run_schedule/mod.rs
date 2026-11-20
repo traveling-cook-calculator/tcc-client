@@ -1,10 +1,45 @@
+use chrono::NaiveDate;
 use uuid::Uuid;
 
 use crate::storage::mapper::Plan as ResolvedPlan;
-use crate::storage::{CourseData, MeetingPointData, TeamData, TeamPlanData};
+use crate::storage::{CourseData, Language, MeetingPointData, TeamData, TeamPlanData};
 
+pub mod builtin;
+pub mod design;
+pub mod export;
+#[allow(dead_code)] // the plan texts were Markdown; kept (with its tests) for future text fields
 mod markdown;
-pub mod run_schedule;
+pub mod sheet_design;
+
+/// What the sheets need besides the plan of the team. The backend stores no plan texts: the title
+/// is the name of the project, the date the day of the event, and the language is the one the
+/// visitor picked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SheetInfo {
+    pub title: String,
+    /// Not known to participants (they cannot read the project).
+    pub date: Option<NaiveDate>,
+    pub language: Language,
+}
+
+/// German for German browsers, English otherwise. The owner's choice for the sheets of the
+/// project (visitors choose their own language on their pages).
+pub fn browser_language() -> Language {
+    let german = web_sys::window()
+        .and_then(|window| window.navigator().language())
+        .is_some_and(|language| language.to_lowercase().starts_with("de"));
+    if german { Language::German } else { Language::English }
+}
+
+impl SheetInfo {
+    pub fn new(title: impl Into<String>, date: Option<NaiveDate>, language: Language) -> Self {
+        SheetInfo { title: title.into(), date, language }
+    }
+
+    pub fn german(&self) -> bool {
+        self.language == Language::German
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Team {
@@ -71,6 +106,7 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    #[allow(dead_code)] // the old preview of the calculation page used it; kept for tests and tools
     pub fn default(
         has_start: bool,
         has_end: bool,

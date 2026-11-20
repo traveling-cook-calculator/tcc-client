@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
 
+use crate::ui::Panel;
+
 use crate::{
     config::Config,
     side::legal::{LegalPageShell, LegalSection},
@@ -107,8 +109,49 @@ pub fn Privacy() -> Element {
                                 purpose: "Kerndienst: Speicherung Ihrer Daten".to_string(),
                                 basis: "Art. 6 Abs. 1 lit. b DSGVO (Vertragserfüllung)".to_string(),
                             }
+                            DataRow {
+                                category: "Daten der Teilnehmenden (siehe 2a)".to_string(),
+                                purpose: "Organisation des Events, Routenberechnung, E-Mails zum Event".to_string(),
+                                basis: "Art. 6 Abs. 1 lit. b/f DSGVO; Ernährungshinweise: Art. 9 Abs. 2 lit. a DSGVO (Einwilligung)".to_string(),
+                            }
                         }
                     }
+                }
+            }
+
+            LegalSection { title: "2a. Teilnehmende und Veranstalter von Events".to_string(),
+                p {
+                    "Wer sich über einen Anmeldelink für ein Event registriert, gibt Teamname, Adresse und \
+                     – je nach Wunsch des Veranstalters – E-Mail, Telefonnummer, Personenzahl und \
+                     Ernährungshinweise an. Zweck ist ausschließlich die Organisation des Events und die \
+                     Berechnung der Route (Art. 6 Abs. 1 lit. b bzw. f DSGVO). Die Angaben sehen der \
+                     Veranstalter und die Teams, die am selben Abend zusammentreffen, soweit sie dafür \
+                     nötig sind (Name, Adresse bzw. Telefonnummer, Personenzahl, Ernährungshinweise). \
+                     Zum Versand von Einladungs-, Bestätigungs- und Routen-E-Mails wird die angegebene \
+                     E-Mail-Adresse verwendet."
+                }
+                p {
+                    "Ernährungshinweise können Rückschlüsse auf Gesundheit oder Religion zulassen. Sie sind \
+                     freiwillig und werden nur mit Ihrer ausdrücklichen Einwilligung gespeichert \
+                     (Art. 9 Abs. 2 lit. a DSGVO). Sie können die Einwilligung jederzeit widerrufen, indem Sie \
+                     die Angabe löschen oder Ihr Team löschen. Minderjährige nehmen nur mit Einverständnis \
+                     der Erziehungsberechtigten teil."
+                }
+                p { class: "font-medium text-zinc-700 mt-2", "Aufbewahrung und Löschung" }
+                ul { class: "list-disc list-inside space-y-1 pl-1",
+                    if let Some(days) = c.retention_canceled_team_days {
+                        li { "Kontaktdaten abgesagter Teams (E-Mail, Telefon, Ernährung, Grund): {days} Tage nach der Absage." }
+                    }
+                    if let Some(days) = c.retention_participant_data_days {
+                        li { "Alle Daten der Teilnehmenden eines Events: {days} Tage nach dem Veranstaltungsdatum." }
+                    }
+                    if let Some(days) = c.retention_project_days {
+                        li { "Das gesamte Projekt des Veranstalters: {days} Tage nach dem Veranstaltungsdatum bzw. der letzten Änderung, je nachdem, was später liegt." }
+                    }
+                    li { "Teilnehmende können ihre Daten jederzeit über ihren persönlichen Link herunterladen oder sofort vollständig löschen; Veranstalter können ihre Daten und ihr Konto unter „Account & data“ exportieren und löschen." }
+                }
+                p { class: "text-xs text-zinc-500 mt-2",
+                    "Eine Absage ersetzt die Löschung nicht: abgesagte Teams bleiben für den Veranstalter sichtbar, bis die oben genannten Fristen ablaufen oder das Team seine Daten löscht."
                 }
             }
 
@@ -330,7 +373,7 @@ struct StorageRowProps {
 #[component]
 fn StorageRow(props: StorageRowProps) -> Element {
     rsx! {
-        div { class: "flex flex-col gap-0.5 p-2.5 rounded-lg bg-zinc-50 border border-zinc-100",
+        Panel { flush: true, class: "flex flex-col gap-0.5 p-2.5",
             p { class: "text-xs font-semibold text-zinc-700", "{props.key_name}" }
             p { class: "text-xs text-zinc-500", "{props.purpose}" }
             p { class: "text-[11px] text-zinc-400",

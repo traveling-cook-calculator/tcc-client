@@ -2,7 +2,7 @@
 //! empty state.
 
 use super::busy::use_busy;
-use super::button::Button;
+use super::button::{button_class, Button, ButtonVariant, HeaderButton};
 use super::form::{Field, TextInput};
 use super::toast::use_toasts;
 use crate::web::copy_text;
@@ -16,6 +16,7 @@ pub enum PillTone {
     Amber,
     Neutral,
     Green,
+    Red,
 }
 
 impl PillTone {
@@ -24,6 +25,7 @@ impl PillTone {
             Self::Amber => "bg-amber-100/80 text-amber-800 border-amber-200/50",
             Self::Neutral => "bg-zinc-100 text-zinc-500 border-zinc-200/50",
             Self::Green => "bg-emerald-100/80 text-emerald-800 border-emerald-200/50",
+            Self::Red => "bg-red-100/80 text-red-800 border-red-200/60",
         }
     }
 }
@@ -56,7 +58,7 @@ pub fn SegmentedTabs(
     rsx! {
         div { class: "flex items-center gap-1.5 bg-amber-50/80 p-1.5 rounded-xl border border-amber-100/80 overflow-x-auto",
             if !label.is_empty() {
-                span { class: "text-[11px] font-semibold tracking-wider text-amber-900/60 uppercase px-2 shrink-0 hidden md:inline",
+                span { class: "{super::form::EYEBROW} px-2 shrink-0 hidden md:inline",
                     "{label}"
                 }
             }
@@ -171,6 +173,71 @@ pub fn Tabs(
     }
 }
 
+// ── InfoTip ──────────────────────────────────────
+
+/// The little "i" that explains something on hover or keyboard focus. The text is also the
+/// accessible name, so it works without a mouse.
+#[component]
+pub fn InfoTip(#[props(into)] text: String) -> Element {
+    rsx! {
+        span { class: "relative group inline-flex cursor-help", tabindex: "0", role: "note", "aria-label": "{text}",
+            super::icons::InfoSVG {}
+            span { role: "tooltip",
+                class: "absolute bottom-full right-0 mb-1.5 hidden group-hover:block group-focus:block \
+                        bg-zinc-800 text-white text-xs rounded-xl px-3 py-2 w-64 z-10 shadow-lg leading-relaxed",
+                "{text}"
+            }
+        }
+    }
+}
+
+// ── Disclosure ───────────────────────────────────
+
+/// A list of folded rows (a "settings list"): each row is one line until it is opened. Keeps rarely
+/// needed things out of the way on small screens. Native `<details>`, so it works with keyboard
+/// and screen readers without code.
+#[component]
+pub fn DisclosureList(children: Element) -> Element {
+    rsx! {
+        div { class: "bg-white rounded-2xl border border-amber-100 shadow-sm overflow-hidden divide-y divide-amber-100 \
+                      max-sm:rounded-none max-sm:border-x-0",
+            {children}
+        }
+    }
+}
+
+#[component]
+pub fn Disclosure(
+    #[props(into)] title: String,
+    /// Destructive actions (cancel, delete) get a red title.
+    #[props(default)] danger: bool,
+    #[props(default)] open: bool,
+    children: Element,
+) -> Element {
+    let title_class = if danger { "text-red-700" } else { "text-zinc-800" };
+    rsx! {
+        details { class: "group", open,
+            summary { class: "flex items-center justify-between gap-3 px-4 min-h-12 py-3 cursor-pointer select-none list-none \
+                              [&::-webkit-details-marker]:hidden hover:bg-amber-50/50 focus-visible:outline-2 \
+                              focus-visible:outline-brand-hover",
+                span { class: "text-sm font-semibold {title_class}", "{title}" }
+                svg {
+                    class: "w-4 h-4 shrink-0 text-zinc-400 transition-transform group-open:rotate-180",
+                    view_box: "0 0 24 24",
+                    fill: "none",
+                    stroke: "currentColor",
+                    stroke_width: "2.5",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                    "aria-hidden": "true",
+                    polyline { points: "6 9 12 15 18 9" }
+                }
+            }
+            div { class: "px-4 pb-4 space-y-3", {children} }
+        }
+    }
+}
+
 // ── Toolbar ──────────────────────────────────────
 
 /// Search / sort bar above a list (dashboard, teams).
@@ -182,6 +249,119 @@ pub fn Toolbar(children: Element) -> Element {
             {children}
         }
     }
+}
+
+// ── ActionMenu ───────────────────────────────────
+
+/// Classes of one entry of an `ActionMenu` (also for `Link { class: menu_item_class(false) }`).
+pub fn menu_item_class(danger: bool) -> &'static str {
+    if danger {
+        "flex w-full items-center rounded-lg px-3 py-2 text-left text-sm text-red-700 hover:bg-red-50 cursor-pointer"
+    } else {
+        "flex w-full items-center rounded-lg px-3 py-2 text-left text-sm text-zinc-700 hover:bg-amber-50 cursor-pointer"
+    }
+}
+
+/// A button that opens a small menu: for the actions that are rarely needed, so that they do not
+/// all compete for attention as buttons of their own. The menu closes after a click on an entry,
+/// a click outside of it, or Escape.
+#[component]
+pub fn ActionMenu(
+    #[props(into)] label: String,
+    /// The app header's quiet look instead of a secondary button.
+    #[props(default)] header: bool,
+    /// Own content of the button (an avatar and a name) instead of `label`, which is then only its
+    /// accessible name.
+    #[props(default)] trigger: Option<Element>,
+    children: Element,
+) -> Element {
+    let mut open = use_signal(|| false);
+    let button_content = rsx! {
+        if let Some(trigger) = trigger.clone() {
+            {trigger}
+        } else {
+            "{label}"
+        }
+        span { class: "text-[10px]", "aria-hidden": "true", "▾" }
+    };
+    rsx! {
+        div {
+            class: "relative",
+            onkeydown: move |e| {
+                if e.key() == Key::Escape {
+                    open.set(false);
+                }
+            },
+            if header {
+                HeaderButton {
+                    label: label.clone(),
+                    expanded: open(),
+                    onclick: move |_| {
+                        let is_open = open();
+                        open.set(!is_open);
+                    },
+                    {button_content}
+                }
+            } else {
+                button {
+                    r#type: "button",
+                    class: button_class(ButtonVariant::Secondary),
+                    "aria-haspopup": "menu",
+                    "aria-expanded": open(),
+                    onclick: move |_| {
+                        let is_open = open();
+                        open.set(!is_open);
+                    },
+                    {button_content}
+                }
+            }
+            if open() {
+                // Invisible layer: a click anywhere else closes the menu.
+                div { class: "fixed inset-0 z-30", onclick: move |_| open.set(false) }
+                div {
+                    role: "menu",
+                    class: "absolute right-0 z-40 mt-2 w-64 rounded-xl border border-amber-100 bg-white p-1.5 shadow-lg",
+                    onclick: move |_| open.set(false),
+                    {children}
+                }
+            }
+        }
+    }
+}
+
+/// One entry of an `ActionMenu` that runs an action.
+#[component]
+pub fn MenuItem(
+    #[props(into)] label: String,
+    #[props(default)] danger: bool,
+    #[props(default)] disabled: bool,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    let class = if disabled {
+        "flex w-full items-center rounded-lg px-3 py-2 text-left text-sm text-zinc-300 cursor-not-allowed"
+    } else {
+        menu_item_class(danger)
+    };
+    rsx! {
+        button {
+            r#type: "button",
+            role: "menuitem",
+            class,
+            disabled,
+            onclick: move |e| {
+                if !disabled {
+                    onclick.call(e);
+                }
+            },
+            "{label}"
+        }
+    }
+}
+
+/// Thin line between groups of entries of an `ActionMenu`.
+#[component]
+pub fn MenuDivider() -> Element {
+    rsx! { div { class: "my-1 h-px bg-amber-100", role: "separator" } }
 }
 
 // ── Skeleton ─────────────────────────────────────
@@ -201,6 +381,10 @@ pub fn CopyField(
     #[props(into)] label: String,
     #[props(into)] value: String,
     #[props(default)] hint: Option<String>,
+    /// Texts of the button and its toasts (the guest pages are German/English).
+    #[props(default = "Copy".to_string(), into)] button_label: String,
+    #[props(default = "Copied".to_string(), into)] copied_label: String,
+    #[props(default = "Copying failed".to_string(), into)] failed_label: String,
 ) -> Element {
     let toasts = use_toasts();
     let copy_task = use_busy();
@@ -211,14 +395,15 @@ pub fn CopyField(
             div { class: "flex gap-2",
                 TextInput { value, class: "flex-1", readonly: true, oninput: move |_| {} }
                 Button {
-                    label: "Copy",
+                    label: button_label,
                     loading: copy_task.is_busy(),
                     onclick: move |_| {
                         let text = text.clone();
+                        let (copied_label, failed_label) = (copied_label.clone(), failed_label.clone());
                         copy_task.run(async move {
                             match copy_text(&text).await {
-                                Ok(()) => toasts.success("Copied", ""),
-                                Err(e) => toasts.error("Copying failed", format!("{e} Select the text and copy it manually.")),
+                                Ok(()) => toasts.success(copied_label, ""),
+                                Err(e) => toasts.error(failed_label, e.to_string()),
                             }
                         });
                     },

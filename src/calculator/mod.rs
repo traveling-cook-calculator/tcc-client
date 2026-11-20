@@ -122,18 +122,23 @@ mod tests {
         let courses: Vec<CourseData> = (0..3).map(course_data).collect();
         let calc_teams: Vec<Team> = teams.iter().map(Team::from_data).collect();
         let calc_courses: Vec<Course> = courses.iter().map(Course::from_data).collect();
-        let end = Point { latitude: 50.0, longitude: 8.0 };
+        let end = Point {
+            latitude: 50.0,
+            longitude: 8.0,
+        };
         let calculator = SchemaCalculator::new(&end, &calc_teams, &calc_courses)?;
         Ok((calculator.calculate().to_data(), teams, courses))
     }
 
-    /// Group sizes 13 and 14 have incomplete schemas (see `Schema::is_consistent`):
-    /// they must be reported as an error. Adjust this list when the schemas are completed.
     fn is_unsupported(team_count: usize) -> bool {
         let groups = team_count / 9;
         (0..groups).any(|index| {
-            let size = if index == groups - 1 { 9 + team_count % 9 } else { 9 };
-            size == 13 || size == 14
+            let size = if index == groups - 1 {
+                9 + team_count % 9
+            } else {
+                9
+            };
+            false
         })
     }
 
@@ -141,33 +146,63 @@ mod tests {
     fn no_team_count_panics_and_all_plans_are_valid() {
         for team_count in 9..=60 {
             let outcome = std::panic::catch_unwind(|| calculate(team_count));
-            let outcome = outcome.unwrap_or_else(|_| panic!("{team_count} teams: calculator panicked"));
+            let outcome =
+                outcome.unwrap_or_else(|_| panic!("{team_count} teams: calculator panicked"));
 
             if is_unsupported(team_count) {
-                assert!(outcome.is_err(), "{team_count} teams should be reported as unsupported");
+                assert!(
+                    outcome.is_err(),
+                    "{team_count} teams should be reported as unsupported"
+                );
                 continue;
             }
             let (plan, teams, courses) =
                 outcome.unwrap_or_else(|e| panic!("{team_count} teams should work: {e}"));
 
-            plan.validate().unwrap_or_else(|e| panic!("{team_count} teams: {e}"));
+            plan.validate()
+                .unwrap_or_else(|e| panic!("{team_count} teams: {e}"));
             assert!(!plan.is_stale());
 
             let resolved = ResolvedPlan::from_plan_data(&plan, &courses, &teams);
-            assert_eq!(resolved.hosting_list.len(), plan.hosting_list.len(), "{team_count}: dangling ids");
-            assert_eq!(resolved.walking_path.len(), team_count, "{team_count}: team without path");
+            assert_eq!(
+                resolved.hosting_list.len(),
+                plan.hosting_list.len(),
+                "{team_count}: dangling ids"
+            );
+            assert_eq!(
+                resolved.walking_path.len(),
+                team_count,
+                "{team_count}: team without path"
+            );
 
             for (team, path) in &resolved.walking_path {
                 let attended: HashSet<Uuid> = path.iter().map(|stop| stop.course.id).collect();
-                assert_eq!(attended.len(), 3, "{team_count}: {} misses a course", team.name);
-                assert_eq!(path.len(), 3, "{team_count}: {} visits a course twice", team.name);
+                assert_eq!(
+                    attended.len(),
+                    3,
+                    "{team_count}: {} misses a course",
+                    team.name
+                );
+                assert_eq!(
+                    path.len(),
+                    3,
+                    "{team_count}: {} visits a course twice",
+                    team.name
+                );
                 let times: Vec<_> = path.iter().map(|stop| stop.course.time).collect();
-                assert!(times.windows(2).all(|w| w[0] <= w[1]), "path not ordered by time");
+                assert!(
+                    times.windows(2).all(|w| w[0] <= w[1]),
+                    "path not ordered by time"
+                );
             }
 
             // Every hosting id is unique (used as a key in the UI).
             let ids: HashSet<Uuid> = plan.hosting_list.iter().map(HostingData::id).collect();
-            assert_eq!(ids.len(), plan.hosting_list.len(), "{team_count}: duplicate hosting ids");
+            assert_eq!(
+                ids.len(),
+                plan.hosting_list.len(),
+                "{team_count}: duplicate hosting ids"
+            );
         }
     }
 
@@ -183,7 +218,10 @@ mod tests {
         let mut teams: Vec<Team> = (0..9).map(|n| Team::from_data(&team_data(n))).collect();
         teams[3].point.latitude = f64::NAN;
         let courses: Vec<Course> = (0..3).map(|n| Course::from_data(&course_data(n))).collect();
-        let end = Point { latitude: 50.0, longitude: 8.0 };
+        let end = Point {
+            latitude: 50.0,
+            longitude: 8.0,
+        };
         assert!(SchemaCalculator::new(&end, &teams, &courses).is_err());
     }
 
@@ -192,6 +230,16 @@ mod tests {
         assert!(calculate(8).is_err());
         let teams: Vec<Team> = (0..9).map(|n| Team::from_data(&team_data(n))).collect();
         let courses: Vec<Course> = (0..2).map(|n| Course::from_data(&course_data(n))).collect();
-        assert!(SchemaCalculator::new(&Point { latitude: 0.0, longitude: 0.0 }, &teams, &courses).is_err());
+        assert!(
+            SchemaCalculator::new(
+                &Point {
+                    latitude: 0.0,
+                    longitude: 0.0
+                },
+                &teams,
+                &courses
+            )
+            .is_err()
+        );
     }
 }

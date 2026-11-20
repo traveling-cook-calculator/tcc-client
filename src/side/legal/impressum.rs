@@ -1,4 +1,5 @@
 use dioxus::prelude::*;
+use crate::ui::SegmentedTabs;
 
 use crate::{
     config::Config,
@@ -150,16 +151,10 @@ pub fn Impressum() -> Element {
         LegalPageShell { title: t.page_title.to_string(),
 
             div { class: "flex justify-end mb-6",
-                button {
-                    r#type: "button",
-                    class: "inline-flex items-center gap-1.5 px-4 py-1.5 rounded-full \
-                            text-sm font-medium border border-zinc-200 bg-white text-zinc-500 \
-                            shadow-sm hover:border-amber-400 hover:text-amber-700 \
-                            transition-all duration-200 cursor-pointer select-none",
-                    onclick: move |_| {
-                        lang.set(if *lang.read() == Lang::De { Lang::En } else { Lang::De });
-                    },
-                    "{t.toggle_btn}"
+                SegmentedTabs {
+                    options: vec!["DE", "EN"],
+                    selected: if current_lang == Lang::De { 0 } else { 1 },
+                    onselect: move |index| lang.set(if index == 0 { Lang::De } else { Lang::En }),
                 }
             }
 

@@ -1,4 +1,16 @@
-@import url('https://fonts.googleapis.com/css2?family=Chewy&family=Gluten:wght@100..900&display=swap');
+/* Fonts are part of the project (assets/fonts): no request to a font server, and the
+   schedule sheets can be exported as images reliably. All fonts are open source,
+   taken from the Fontsource packages (licenses: see assets/fonts/FONTS.md); only the Latin subset
+   (German umlauts included). */
+@font-face { font-family: "Chewy"; font-weight: 400; font-display: swap; src: url("/assets/fonts/chewy-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Gluten"; font-weight: 100 900; font-display: swap; src: url("/assets/fonts/gluten-latin-wght-normal.woff2") format("woff2"); }
+@font-face { font-family: "Archivo Black"; font-weight: 400; font-display: swap; src: url("/assets/fonts/archivo-black-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Bebas Neue"; font-weight: 400; font-display: swap; src: url("/assets/fonts/bebas-neue-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Inter"; font-weight: 400; font-display: swap; src: url("/assets/fonts/inter-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Inter"; font-weight: 700; font-display: swap; src: url("/assets/fonts/inter-latin-700-normal.woff2") format("woff2"); }
+@font-face { font-family: "Pacifico"; font-weight: 400; font-display: swap; src: url("/assets/fonts/pacifico-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Playfair Display"; font-weight: 400; font-display: swap; src: url("/assets/fonts/playfair-display-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "Playfair Display"; font-weight: 700; font-display: swap; src: url("/assets/fonts/playfair-display-latin-700-normal.woff2") format("woff2"); }
 
 @import "tailwindcss";
 

@@ -4,6 +4,7 @@ use chrono::{NaiveDate, NaiveTime};
 use dioxus::prelude::*;
 use uuid::Uuid;
 
+use crate::config::Config;
 use crate::data::use_storage;
 use crate::keycloak::AuthState;
 use crate::storage::{CookAndRunMetaData, CookAndRunMetaUpdate};
@@ -62,6 +63,18 @@ pub fn Overview(cook_and_run_id: ReadSignal<Uuid>) -> Element {
 // ─────────────────────────────────────────────
 //  Content
 // ─────────────────────────────────────────────
+
+/// Hint for the organizer: when the data of the participating teams is deleted. Only for cloud
+/// projects (teams exist there) and only if the period is configured; the API decides, this is
+/// information.
+fn retention_notice(is_cloud: bool, occur: NaiveDate, days: Option<u32>) -> Option<String> {
+    let days = days.filter(|_| is_cloud)?;
+    let date = occur.checked_add_signed(chrono::Duration::days(i64::from(days)))?;
+    Some(format!(
+        "The data of the participating teams is deleted automatically on {} ({days} days after the event).",
+        date.format("%d.%m.%Y")
+    ))
+}
 
 #[derive(Clone, PartialEq)]
 struct Draft {
@@ -159,6 +172,9 @@ fn OverviewContent(meta: CookAndRunMetaData) -> Element {
         });
     };
 
+    let config = use_context::<Signal<Option<Config>>>();
+    let retention_days = config.read().as_ref().and_then(|config| config.legal.retention_participant_data_days);
+
     rsx! {
         PageShell {
             PageHeader { title: "Overview" }
@@ -244,6 +260,13 @@ fn OverviewContent(meta: CookAndRunMetaData) -> Element {
                     p { class: "text-xs text-zinc-400",
                         "You need to be logged in to upload or download projects."
                     }
+                }
+            }
+
+            if let Some(notice) = retention_notice(is_cloud, current.occur, retention_days) {
+                Card { title: "Data retention",
+                    p { class: "text-sm text-zinc-600 leading-relaxed", "{notice}" }
+                    p { class: "text-xs text-zinc-400", "Download your data under \"Account & data\" if you want to keep it." }
                 }
             }
 
@@ -410,5 +433,24 @@ fn UploadDialog(project_id: Uuid, default_email: String, onclose: EventHandler<(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+
+    #[test]
+    fn the_notice_names_the_deletion_date() {
+        let occur = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        let text = retention_notice(true, occur, Some(30)).unwrap();
+        assert!(text.contains("20.07.2026"), "{text}");
+    }
+
+    #[test]
+    fn there_is_no_notice_for_local_projects_or_without_a_configured_period() {
+        let occur = NaiveDate::from_ymd_opt(2026, 6, 20).unwrap();
+        assert!(retention_notice(false, occur, Some(30)).is_none());
+        assert!(retention_notice(true, occur, None).is_none());
     }
 }

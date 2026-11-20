@@ -1,21 +1,24 @@
-//! A team's personal page: `/cook-and-run/{project}/team/{team}/{token}`.
+//! A team's personal page: `/project/{project}/team/{team}#token=…`.
 //!
 //! The token (chosen by the browser at registration, see `register.rs`) is the team's only
-//! credential and part of the URL. Everything the backend offers for it is available here:
+//! credential and part of the link (in the fragment). The page is one status card on top, then the
+//! team's details next to a column with its link, its data and the cancellation:
 //!
-//! | backend call                                  | where                         |
-//! |-----------------------------------------------|-------------------------------|
-//! | `select_team_with_access`                     | loading the page              |
-//! | `update_team_with_access`                     | `edit.rs` – "Save changes"    |
-//! | `cancel_team`                                 | `edit.rs` – cancel card       |
-//! | `verify_team_email`, `resend_team_verification` | `edit.rs` – verification card |
-//! | `select_team_plan`                            | `plan.rs` – "Plan" tab        |
+//! | backend call                                    | where                          |
+//! |-------------------------------------------------|--------------------------------|
+//! | `select_team_with_access`                       | loading the page               |
+//! | `update_team_with_access`                       | `edit.rs` - "Save changes"     |
+//! | `cancel_team`                                   | `edit.rs` - cancel card        |
+//! | `verify_team_email`, `resend_team_verification` | `status.rs` - email address    |
+//! | `select_team_plan`                              | `plan.rs` - "Plan" tab         |
 //!
-//! `/…/{token}/verify` is the link for the verification mail: same page, and it confirms the
-//! email address on arrival.
+//! Opened with the link of the invitation mail (`#token=…&verify=…`) the page also confirms the
+//! email address on arrival. The secret of that link exists only in the mail: the link the team
+//! keeps (and everything the page and the API show) can not confirm anything.
 
 mod edit;
 mod plan;
+mod status;
 
 use chrono::Utc;
 use dioxus::prelude::*;
@@ -25,10 +28,21 @@ use super::lang::Lang;
 use super::use_participant;
 use crate::data::Storage;
 use crate::storage::{ShareTeamConfig, TeamAccess, TeamData, TeamStatus};
-use crate::time::format_local;
 use crate::ui::*;
-use edit::{CancelCard, TeamEditCard, VerifyNotice};
+use edit::{CancelSection, DataSection, LinkSection, TeamEditCard};
 use plan::PlanTab;
+use status::TeamHeader;
+
+/// Why the details can not be changed (the area is greyed out). Checked on the page, so a request
+/// that the server would refuse is not made.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lock {
+    /// The team canceled: its data is deleted or frozen.
+    Canceled,
+    /// The edit deadline of the organiser has passed.
+    EditClosed,
+}
+
 
 /// Team and the rules of its project, loaded together.
 #[derive(Clone, PartialEq)]
@@ -44,7 +58,32 @@ pub fn TeamPage(
     team_id: ReadSignal<Uuid>,
     access_token: ReadSignal<Uuid>,
 ) -> Element {
-    rsx! { TeamView { cook_and_run_id, team_id, access_token, verify: false } }
+    rsx! { TeamView { cook_and_run_id, team_id, access_token, verify_secret: None } }
+}
+
+/// Link of the mails: `/project/{project}/team/{team}#token={token}`. The token is read from the
+/// URL fragment (see `deeplink.rs`).
+#[component]
+pub fn TeamDeepLink(cook_and_run_id: ReadSignal<Uuid>, team_id: ReadSignal<Uuid>) -> Element {
+    let token = crate::web::team_token(team_id());
+    let access_token = use_signal(|| token.unwrap_or_else(Uuid::nil));
+    // Only the link of the invitation mail carries it.
+    let verify_secret = use_hook(crate::web::team_verify_secret);
+
+    match token {
+        Some(_) => rsx! {
+            TeamView { key: "{team_id()}", cook_and_run_id, team_id, access_token: ReadSignal::from(access_token), verify_secret }
+        },
+        None => {
+            let lang = Lang::default();
+            let t = lang.txt();
+            rsx! {
+                div { class: "flex-1 min-w-0 w-full sm:max-w-2xl sm:mx-auto flex flex-col sm:py-10 sm:px-4 gap-4",
+                    EmptyState { title: t.link_incomplete_title, text: t.link_incomplete_body }
+                }
+            }
+        }
+    }
 }
 
 #[component]
@@ -53,7 +92,9 @@ pub fn TeamVerifyPage(
     team_id: ReadSignal<Uuid>,
     access_token: ReadSignal<Uuid>,
 ) -> Element {
-    rsx! { TeamView { cook_and_run_id, team_id, access_token, verify: true } }
+    // Links of this shape (token in the path) were mailed before the confirmation secret existed:
+    // they open the team, the address is confirmed with the new mail (see the status card).
+    rsx! { TeamView { cook_and_run_id, team_id, access_token, verify_secret: None } }
 }
 
 #[component]
@@ -61,7 +102,7 @@ fn TeamView(
     cook_and_run_id: ReadSignal<Uuid>,
     team_id: ReadSignal<Uuid>,
     access_token: ReadSignal<Uuid>,
-    verify: bool,
+    verify_secret: Option<Uuid>,
 ) -> Element {
     let participant = use_participant();
     let mut lang = use_signal(Lang::default);
@@ -78,7 +119,8 @@ fn TeamView(
             let storage = participant.connect().await?;
             let backend = storage.read().await;
             let team = backend.select_team_with_access(id, team_id, &TeamAccess::Token(token)).await?;
-            let config = backend.select_cook_and_run_share_config(id).await.ok().flatten();
+            // The team's own link carries no login either: the public configuration.
+            let config = backend.select_public_share_config(id).await.ok().flatten();
             Ok::<_, String>(TeamPageData { team, config })
         }
     });
@@ -87,7 +129,7 @@ fn TeamView(
     let t = current.txt();
 
     rsx! {
-        div { class: "flex-1 min-w-0 w-full sm:max-w-2xl sm:mx-auto flex flex-col sm:py-10 sm:px-4 gap-4 sm:gap-5",
+        div { class: "flex-1 min-w-0 w-full sm:max-w-5xl sm:mx-auto flex flex-col sm:py-10 sm:px-4 gap-4 sm:gap-5",
             div { class: "px-4 sm:px-0 pt-4 sm:pt-0",
                 PageHeader {
                     title: t.team_page_title,
@@ -111,7 +153,7 @@ fn TeamView(
                         access_token: access_token(),
                         data: data.clone(),
                         lang: current,
-                        verify,
+                        verify_secret,
                     }
                 },
                 (Some(Err(details)), _) => rsx! {
@@ -157,7 +199,7 @@ fn TeamContent(
     access_token: Uuid,
     data: TeamPageData,
     lang: Lang,
-    verify: bool,
+    verify_secret: Option<Uuid>,
 ) -> Element {
     let t = lang.txt();
     let mut tab = use_signal(|| 0usize);
@@ -166,33 +208,35 @@ fn TeamContent(
 
     let TeamPageData { team, config } = &data;
     let canceled = team.status == TeamStatus::Canceled;
-    let edit_closed = config
-        .as_ref()
-        .and_then(|config| config.edit_deadline)
-        .is_some_and(|deadline| deadline < now);
-    let verified = team.cloud.as_ref().is_some_and(|cloud| cloud.email_verified_at.is_some());
-    let needs_verification = team.mail.is_some()
-        && !verified
-        && !canceled
-        && (verify || config.as_ref().is_some_and(|config| config.require_email_verification));
-    let reviews_changes = config.as_ref().is_some_and(|config| !config.review_trigger_fields.is_empty());
+    let edit_deadline = config.as_ref().and_then(|config| config.edit_deadline);
+    let edit_closed = edit_deadline.is_some_and(|deadline| deadline < now);
+    // An unconfirmed address does not lock anything: the address may be wrong, and then the team
+    // has to be able to correct it (or cancel).
+    let lock = if canceled {
+        Some(Lock::Canceled)
+    } else if edit_closed {
+        Some(Lock::EditClosed)
+    } else {
+        None
+    };
+    let plan_published = config.as_ref().map(|config| config.plan_published);
+    let team_link = super::team_url(cook_and_run_id, team_id, access_token);
+    // Cancelling stays possible while the address is unconfirmed; only the deadline and an
+    // earlier cancellation stop it.
+    let cancel_closed = canceled || edit_closed;
 
     rsx! {
-        if canceled {
-            CanceledCard { team: team.clone(), lang }
-        }
-        if needs_verification {
-            VerifyNotice { storage, cook_and_run_id, team_id, access_token, lang, auto_verify: verify }
-        }
-        if team.status == TeamStatus::Review {
-            div { class: "mx-4 sm:mx-0 flex flex-wrap items-center gap-2",
-                Pill { tone: PillTone::Amber, "{t.status_review}" }
-            }
-        }
-        if edit_closed && !canceled {
-            div { class: "mx-4 sm:mx-0 rounded-xl border border-amber-300 bg-amber-50 px-4 py-3",
-                p { class: "text-sm font-semibold text-amber-700", "{t.edit_closed}" }
-            }
+        TeamHeader {
+            storage,
+            cook_and_run_id,
+            team_id,
+            access_token,
+            team: team.clone(),
+            config: config.clone(),
+            lock,
+            plan_published,
+            verify_secret,
+            lang,
         }
 
         div { class: "px-4 sm:px-0",
@@ -203,46 +247,52 @@ fn TeamContent(
             }
         }
 
-        // The plan tab only exists (and loads) once it is opened.
         if tab() == 0 {
-            TeamEditCard {
-                storage,
-                cook_and_run_id,
-                team_id,
-                access_token,
-                team: team.clone(),
-                config: config.clone(),
-                read_only: canceled || edit_closed,
-                reviews_changes,
-                lang,
+            div { class: "grid gap-4 sm:gap-5 lg:grid-cols-3 items-start",
+                div { class: "lg:col-span-2 min-w-0",
+                    TeamEditCard {
+                        storage,
+                        cook_and_run_id,
+                        team_id,
+                        access_token,
+                        team: team.clone(),
+                        config: config.clone(),
+                        lock,
+                        lang,
+                    }
+                }
+                // Link, data and cancellation: one line each until opened.
+                DisclosureList {
+                    Disclosure { title: t.link_title, open: team.mail.is_none(),
+                        LinkSection { team_link, has_mail: team.mail.is_some(), lang }
+                    }
+                    Disclosure { title: t.data_title,
+                        DataSection { storage, cook_and_run_id, team_id, access_token, lang }
+                    }
+                    if !canceled {
+                        Disclosure { title: t.cancel_title, danger: true,
+                            CancelSection {
+                                storage,
+                                cook_and_run_id,
+                                team_id,
+                                access_token,
+                                edit_deadline,
+                                closed: cancel_closed,
+                                lang,
+                            }
+                        }
+                    }
+                }
             }
-            if !canceled {
-                CancelCard { storage, cook_and_run_id, team_id, access_token, lang }
-            }
+        } else if canceled {
+            EmptyState { title: t.plan_canceled_title, text: t.plan_canceled_body }
+        } else if plan_published == Some(false) {
+            // No design chosen yet: there is no plan to show, and nothing is requested for it.
+            EmptyState { title: t.plan_unavailable_title, text: t.plan_unavailable_body }
         } else {
+            // The plan tab only exists (and loads) once it is opened.
             PlanTab { storage, cook_and_run_id, team_id, access_token, lang }
         }
     }
 }
 
-#[component]
-fn CanceledCard(team: TeamData, lang: Lang) -> Element {
-    let t = lang.txt();
-    let cloud = team.cloud.as_ref();
-    let when = cloud.and_then(|cloud| cloud.canceled_at).map(format_local);
-    let reason = cloud
-        .and_then(|cloud| cloud.cancel_reason.clone())
-        .filter(|reason| !reason.trim().is_empty());
-
-    rsx! {
-        Card { title: t.canceled_title, tone: Tone::Danger, class: "max-sm:rounded-none max-sm:border-x-0",
-            p { class: "text-sm text-zinc-700", "{t.canceled_body}" }
-            if let Some(when) = when {
-                p { class: "text-xs text-zinc-500", "{when}" }
-            }
-            if let Some(reason) = reason {
-                p { class: "text-xs text-zinc-600 whitespace-pre-wrap", "{t.canceled_reason}: {reason}" }
-            }
-        }
-    }
-}

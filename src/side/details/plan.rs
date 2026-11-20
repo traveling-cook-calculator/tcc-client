@@ -3,11 +3,15 @@
 use dioxus::prelude::*;
 use uuid::Uuid;
 
-use super::run_schedule::run_schedule::{download, RunSchedule};
-use super::run_schedule::Schedule;
+use super::run_schedule::design::{download_design, DesignedSchedule};
+use super::run_schedule::export::file_stem;
+use super::run_schedule::sheet_design::{load_active_design, LanguageTabs};
+use super::run_schedule::{browser_language, Schedule, SheetInfo};
 use crate::data::use_storage;
+use crate::schedule_design::{ScheduleDesign, EXPORT_WIDTH};
 use crate::storage::mapper::Plan as ResolvedPlan;
-use crate::storage::{PlanConfigData, TeamAccess};
+use crate::storage::{Language, MeetingPointData, PlanData, StorageManager, TeamAccess};
+use crate::time::to_local;
 use crate::ui::*;
 
 /// Everything the page can end up showing.
@@ -15,7 +19,47 @@ use crate::ui::*;
 enum PlanPage {
     NoPlan,
     NotInPlan,
-    Ready { config: PlanConfigData, schedule: Schedule },
+    Ready { project_name: String, date: chrono::NaiveDate, design: Option<ScheduleDesign>, schedule: Schedule },
+}
+
+/// The schedule sheet of one team, or `None` if the team is not part of the plan.
+pub(crate) async fn team_schedule(
+    storage: &StorageManager,
+    id: Uuid,
+    team_id: Uuid,
+    plan: &PlanData,
+    is_cloud: bool,
+    start: &Option<MeetingPointData>,
+    end: &Option<MeetingPointData>,
+) -> Result<Option<Schedule>, String> {
+    if is_cloud {
+        // The backend computes the sheet of one team: one request. Resolving it from the
+        // team list would cost one request per team and exceeded the rate limit.
+        let team_plan = storage.select_team_plan(id, team_id, &TeamAccess::Admin).await?;
+        Ok(Some(Schedule::from_team_plan(&team_plan, start, end)))
+    } else {
+        // Local projects: everything is in the browser, no requests involved.
+        let courses = storage.select_cook_and_run_course_list(id).await?;
+        let teams = storage.select_cook_and_run_team_list(id).await?;
+        let resolved = ResolvedPlan::from_plan_data(plan, &courses, &teams);
+        Ok(Schedule::for_team(team_id, &resolved, start, end))
+    }
+}
+
+/// Loads everything for the sheet of one team (used by the schedule designer for its preview).
+pub(crate) async fn load_team_schedule(
+    storage: crate::data::Storage,
+    id: Uuid,
+    team_id: Uuid,
+) -> Result<Option<Schedule>, String> {
+    let storage = storage.read().await;
+    let is_cloud = storage.select_cook_and_run_meta(id).await?.is_in_cloud;
+    let Some(plan) = storage.select_plan_of_cook_and_run(id).await? else {
+        return Ok(None);
+    };
+    let start = storage.select_cook_and_run_start_point(id).await?;
+    let end = storage.select_cook_and_run_end_point(id).await?;
+    team_schedule(&storage, id, team_id, &plan, is_cloud, &start, &end).await
 }
 
 #[component]
@@ -30,29 +74,28 @@ pub fn Plan(cook_and_run_id: ReadSignal<Uuid>, team_id: ReadSignal<Uuid>) -> Ele
             let _ = storage.revision();
             let storage = storage.read().await;
 
-            let is_cloud = storage.select_cook_and_run_meta(id).await?.is_in_cloud;
+            let meta = storage.select_cook_and_run_meta(id).await?;
+            let (is_cloud, project_name) = (meta.is_in_cloud, meta.name);
+            let date = to_local(meta.occur).date_naive();
             let Some(plan) = storage.select_plan_of_cook_and_run(id).await? else {
                 return Ok(PlanPage::NoPlan);
             };
-            let config = storage.select_plan_config_of_cook_and_run(id).await?.unwrap_or_default();
             let start = storage.select_cook_and_run_start_point(id).await?;
             let end = storage.select_cook_and_run_end_point(id).await?;
 
-            let schedule = if is_cloud {
-                // The backend computes the sheet of one team: one request. Resolving it from the
-                // team list would cost one request per team and exceeded the rate limit.
-                let team_plan = storage.select_team_plan(id, team_id, &TeamAccess::Admin).await?;
-                Some(Schedule::from_team_plan(&team_plan, &start, &end))
-            } else {
-                // Local projects: everything is in the browser, no requests involved.
-                let courses = storage.select_cook_and_run_course_list(id).await?;
-                let teams = storage.select_cook_and_run_team_list(id).await?;
-                let resolved = ResolvedPlan::from_plan_data(&plan, &courses, &teams);
-                Schedule::for_team(team_id, &resolved, &start, &end)
+            let schedule = team_schedule(&storage, id, team_id, &plan, is_cloud, &start, &end).await?;
+
+            // A design that cannot be loaded is reported like a missing one (there is no other sheet).
+            let design = match load_active_design(&storage, id, is_cloud).await {
+                Ok(design) => design,
+                Err(e) => {
+                    web_sys::console::warn_1(&format!("The design could not be loaded: {e}").into());
+                    None
+                }
             };
 
             Ok(match schedule {
-                Some(schedule) => PlanPage::Ready { config, schedule },
+                Some(schedule) => PlanPage::Ready { project_name, date, design, schedule },
                 None => PlanPage::NotInPlan,
             })
         }
@@ -75,30 +118,67 @@ pub fn Plan(cook_and_run_id: ReadSignal<Uuid>, team_id: ReadSignal<Uuid>) -> Ele
                     error_details: "Recalculate the plan to include it.",
                 }
             },
-            PlanPage::Ready { config, schedule } => rsx! {
-                PlanContent { key: "{key}", config, schedule }
+            PlanPage::Ready { project_name, date, design, schedule } => rsx! {
+                OwnerPlan { key: "{key}", project_name, date, design, schedule }
             },
         },
     )
 }
 
+/// The sheet for the organizer, who picks the language of the sheet.
 #[component]
-pub(crate) fn PlanContent(config: PlanConfigData, schedule: Schedule) -> Element {
+fn OwnerPlan(
+    project_name: String,
+    date: chrono::NaiveDate,
+    design: Option<ScheduleDesign>,
+    schedule: Schedule,
+) -> Element {
+    let mut language = use_signal(browser_language);
+    let info = SheetInfo::new(project_name.clone(), Some(date), language());
+    // The sheets are drawn with the design of the project. Without one there is nothing to show.
+    let Some(design) = design else {
+        return rsx! {
+            EmptyState {
+                title: "No design for the sheets yet",
+                text: "Create a design on the Schedules page (and use it for the teams). The sheets of the teams appear here once there is one.",
+            }
+        };
+    };
+    rsx! {
+        div { class: "w-full min-w-0",
+            div { class: "mb-4 flex justify-center",
+                LanguageTabs { value: language(), onchange: move |value: Language| language.set(value) }
+            }
+            PlanContent { project_name: Some(project_name), info, schedule, design }
+        }
+    }
+}
+
+#[component]
+pub(crate) fn PlanContent(
+    /// Name of the project, the first part of the file name of the download. Without it (the page of
+    /// a participant, who cannot read the project) the title of the sheet is used.
+    #[props(default)]
+    project_name: Option<String>,
+    info: SheetInfo,
+    schedule: Schedule,
+    /// The design of the project (made on the Schedules page). There is no other way to draw a sheet.
+    design: ScheduleDesign,
+) -> Element {
     let download_task = use_busy();
-    let title = config.title.clone();
-    let team_name = schedule.host.name.clone();
+    let toasts = use_toasts();
+    let file_name = file_stem(project_name.as_deref().unwrap_or(&info.title), &schedule.host.name);
 
     rsx! {
-        button {
-            r#type: "button",
-            "aria-label": "Download schedule as image",
-            title: "Download as image",
-            class: "fixed bottom-6 right-6 z-40 flex items-center justify-center w-14 h-14 rounded-full \
-                    bg-brand-hover text-white shadow-lg hover:shadow-xl hover:scale-110 \
-                    transition-all duration-150 cursor-pointer",
+        FloatingButton {
+            label: "Download as image",
             onclick: move |_| {
-                let (title, team_name) = (title.clone(), team_name.clone());
-                download_task.run(async move { download(title, team_name).await });
+                let file_name = file_name.clone();
+                download_task.run(async move {
+                    if let Err(e) = download_design(&file_name, EXPORT_WIDTH).await {
+                        toasts.error("The image could not be created", e);
+                    }
+                });
             },
             if download_task.is_busy() {
                 Spinner {}
@@ -107,6 +187,10 @@ pub(crate) fn PlanContent(config: PlanConfigData, schedule: Schedule) -> Element
             }
         }
 
-        RunSchedule { plan_config: config, schedule }
+        div { class: "w-full min-w-0",
+            div { class: "mx-auto w-full max-w-xl",
+                DesignedSchedule { design, config: info, schedule }
+            }
+        }
     }
 }

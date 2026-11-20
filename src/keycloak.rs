@@ -204,15 +204,7 @@ impl AuthState {
             );
         }
 
-        let auth_url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256",
-            oidc_discovery.authorization_endpoint,
-            urlencoding::encode(&config.client_id),
-            urlencoding::encode(&format!("{}/callback", &config.redirect)),
-            urlencoding::encode(SCOPE),
-            urlencoding::encode(&state),
-            code_challenge,
-        );
+        let auth_url = authorization_url(&config, &oidc_discovery, &state, &code_challenge, "");
 
         (AuthState::LoggedOut(config, oidc_discovery), Some(auth_url))
     }
@@ -279,6 +271,12 @@ impl AuthState {
     /// }
     /// ```
     pub async fn refresh(self) -> Self {
+        self.refresh_with_margin(300).await
+    }
+
+    /// Like [`AuthState::refresh`], but renews the token as soon as it is valid for less than
+    /// `margin_secs` seconds.
+    pub async fn refresh_with_margin(self, margin_secs: i64) -> Self {
         let (config, oidc_discovery, session_data) = match self {
             AuthState::LoggedIn(config, oidc_discovery, session_data) => {
                 console::debug_1(&"User is logged in!".into());
@@ -293,7 +291,7 @@ impl AuthState {
         };
 
         console::debug_1(&"Checking if session is still valid...".into());
-        if session_data.is_valid_for(300) {
+        if session_data.is_valid_for(margin_secs) {
             console::debug_1(&"Session is still valid, no need to refresh".into());
             return AuthState::LoggedIn(config, oidc_discovery, session_data);
         }
@@ -337,9 +335,19 @@ impl AuthState {
         };
 
         if !response.status().is_success() {
-            // Refresh Token ist abgelaufen oder widerrufen → User muss sich neu anmelden
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
+            if !status.is_client_error() {
+                // Keycloak is down or overloaded (5xx): the session itself is probably fine.
+                // Keep it, so that the next attempt can still succeed.
+                console::error_1(&format!("Refresh failed temporarily ({}): {}", status, body).into());
+                return AuthState::Error(
+                    config,
+                    oidc_discovery,
+                    format!("Refresh failed temporarily ({})", status),
+                );
+            }
+            // Refresh Token ist abgelaufen oder widerrufen → User muss sich neu anmelden
             console::error_1(&format!("Refresh token rejected ({}): {}", status, body).into());
             let _ = SessionData::clear();
             return AuthState::LoggedOut(config, oidc_discovery);
@@ -360,20 +368,14 @@ impl AuthState {
         let valid_until = chrono::Local::now().naive_local()
             + chrono::Duration::seconds(token_response.expires_in);
 
-        let user = match get_user_info(&oidc_discovery, &token_response.access_token).await {
-            Ok(user) => user,
-            Err(e) => {
-                console::error_1(&format!("Error fetching user info during refresh: {}", e).into());
-                return AuthState::Error(config, oidc_discovery, e);
-            }
-        };
-
+        // The user does not change with a refresh: no extra userinfo request that could fail.
         let new_session = SessionData {
             access_token: token_response.access_token,
             id_token: token_response.id_token,
-            refresh_token: token_response.refresh_token,
+            // Keycloak may rotate the refresh token; if it sends none, the old one stays valid.
+            refresh_token: token_response.refresh_token.or(Some(refresh_token)),
             valid_until,
-            user,
+            user: session_data.user.clone(),
         };
 
         if let Err(e) = new_session.save() {
@@ -388,6 +390,127 @@ impl AuthState {
 
         console::debug_1(&"Session successfully refreshed".into());
         AuthState::LoggedIn(config, oidc_discovery, new_session)
+    }
+
+    /// The access token of a logged in user (used to see whether a session was replaced).
+    /// The logged in user as the login server describes him.
+    pub fn user(&self) -> Option<&UserData> {
+        match self {
+            AuthState::LoggedIn(_, _, session) => Some(&session.user),
+            _ => None,
+        }
+    }
+
+    /// Keycloak's own account page of the user: there he changes the data of the login account
+    /// (name, email address, password, sessions). The app does not copy any of that.
+    pub fn account_console_url(&self) -> Option<String> {
+        match self {
+            AuthState::LoggedIn(config, _, _) => Some(account_console_url(config)),
+            _ => None,
+        }
+    }
+
+    pub fn access_token(&self) -> Option<&str> {
+        match self {
+            AuthState::LoggedIn(_, _, session) => Some(session.access_token.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Periodic check for a long-open page: renews the token before it expires.
+    ///
+    /// Returns the new state, or `None` if nothing has to change:
+    /// * token still valid for `margin_secs` → `None` (purely local, no request),
+    /// * renewed → `LoggedIn` with the new session,
+    /// * refresh token rejected or the session ran out → `LoggedOut`,
+    /// * temporary problem (offline, Keycloak down) → `None`; the old session stays and the next
+    ///   check tries again. A background check must never log the user out because of a bad minute.
+    pub async fn keep_alive(&self, margin_secs: i64) -> Option<Self> {
+        let AuthState::LoggedIn(config, discovery, session) = self else {
+            return None;
+        };
+
+        // Another tab of this app may have renewed the session already. Refresh tokens can be
+        // single-use, so using our outdated one could end the session for both tabs: adopt the
+        // newer session from the browser storage instead.
+        let mut current = self.clone();
+        let mut adopted = false;
+        if let Some(stored) = SessionData::load()
+            && stored.user == session.user
+            && stored.valid_until > session.valid_until
+        {
+            current = AuthState::LoggedIn(config.clone(), discovery.clone(), stored);
+            adopted = true;
+        }
+        let AuthState::LoggedIn(_, _, session) = &current else {
+            return None;
+        };
+
+        if session.is_valid_for(margin_secs) {
+            return adopted.then_some(current);
+        }
+        if session.refresh_token.is_none() {
+            // Nothing to renew with: the user stays logged in until the token really ends.
+            if session.is_valid_for(0) {
+                return adopted.then_some(current);
+            }
+            let _ = SessionData::clear();
+            return Some(AuthState::LoggedOut(config.clone(), discovery.clone()));
+        }
+
+        match current.refresh_with_margin(margin_secs).await {
+            renewed @ (AuthState::LoggedIn(..) | AuthState::LoggedOut(..)) => Some(renewed),
+            AuthState::Error(_, _, message) => {
+                console::warn_1(&format!("Session refresh failed, will retry: {message}").into());
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// Starts Keycloak's "delete account" action for the logged in user and returns the URL to
+    /// navigate to. Call it **after** the API data is gone. The local session is dropped right
+    /// away; when Keycloak redirects back, [`AuthState::finish_account_deletion`] ends the flow.
+    ///
+    /// Needs the realm to offer the required action `delete_account` and the user to have the role
+    /// `delete-account` of the client `account` (see the realm of the test environment).
+    pub async fn request_account_deletion(self, return_to: String) -> (Self, Option<String>) {
+        let (config, oidc_discovery) = match self {
+            AuthState::LoggedIn(config, oidc_discovery, _) => (config, oidc_discovery),
+            other => {
+                console::warn_1(&"Cannot delete the account when not logged in".into());
+                return (other, None);
+            }
+        };
+
+        let code_verifier = generate_random_string(128);
+        let code_challenge = generate_code_challenge(&code_verifier);
+        let state = generate_random_string(32);
+        let process_data = ProcessData { code_verifier, state: state.clone(), return_to };
+        if let Err(e) = process_data.save() {
+            console::error_1(&format!("Error saving process data: {}", e).into());
+            return (AuthState::Error(config, oidc_discovery, "Error saving process data".to_string()), None);
+        }
+        if let Err(e) = SessionData::clear() {
+            console::warn_1(&format!("Error clearing session data: {}", e).into());
+        }
+
+        let url = authorization_url(&config, &oidc_discovery, &state, &code_challenge, "&kc_action=delete_account");
+        (AuthState::LoggedOut(config, oidc_discovery), Some(url))
+    }
+
+    /// Ends the account deletion when Keycloak sends the browser back: no code is exchanged (the
+    /// account is gone or the user backed out), nothing of the session stays.
+    pub fn finish_account_deletion(self) -> Self {
+        let _ = ProcessData::clear();
+        let _ = SessionData::clear();
+        match self {
+            AuthState::Loading(config, od, _)
+            | AuthState::LoggedOut(config, od)
+            | AuthState::LoggedIn(config, od, _)
+            | AuthState::Error(config, od, _) => AuthState::LoggedOut(config, od),
+            AuthState::NotAvailable() => AuthState::NotAvailable(),
+        }
     }
 
     pub async fn logout(self) -> (Self, Option<String>) {
@@ -422,6 +545,27 @@ impl AuthState {
             Some(logout_url),
         )
     }
+}
+
+/// Authorization request of the code flow with PKCE. `extra` is appended as is (already encoded),
+/// e.g. `&kc_action=delete_account`.
+fn authorization_url(
+    config: &AuthConfig,
+    discovery: &OidcDiscovery,
+    state: &str,
+    code_challenge: &str,
+    extra: &str,
+) -> String {
+    format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&scope={}&state={}&code_challenge={}&code_challenge_method=S256{}",
+        discovery.authorization_endpoint,
+        urlencoding::encode(&config.client_id),
+        urlencoding::encode(&format!("{}/callback", &config.redirect)),
+        urlencoding::encode(SCOPE),
+        urlencoding::encode(state),
+        code_challenge,
+        extra,
+    )
 }
 
 async fn get_user_info(discovery: &OidcDiscovery, access_token: &str) -> Result<UserData, String> {
@@ -517,6 +661,14 @@ fn generate_code_challenge(code_verifier: &str) -> String {
     general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
+fn account_console_url(config: &AuthConfig) -> String {
+    format!(
+        "{}/realms/{}/account",
+        config.domain.trim_end_matches('/'),
+        urlencoding::encode(&config.realm),
+    )
+}
+
 async fn fetch_discovery(config: &AuthConfig) -> Result<OidcDiscovery, String> {
     let url = format!(
         "{}/realms/{}/.well-known/openid-configuration",
@@ -584,5 +736,22 @@ mod tests {
         assert!(!is_callback_path("/"));
         assert!(!is_callback_path("/cook-and-run/1/overview"));
         assert!(!is_callback_path("/callbacks"));
+    }
+}
+
+#[cfg(test)]
+mod account_url_tests {
+    use super::*;
+
+    #[test]
+    fn the_account_console_is_the_realms_account_page() {
+        let config = AuthConfig {
+            domain: "https://auth.example.org/".into(),
+            realm: "cook and run".into(),
+            client_id: "tcc".into(),
+            redirect: "https://app.example.org".into(),
+            audience: "tcc".into(),
+        };
+        assert_eq!(account_console_url(&config), "https://auth.example.org/realms/cook%20and%20run/account");
     }
 }

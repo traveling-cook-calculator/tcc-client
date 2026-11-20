@@ -2,8 +2,8 @@ use chrono::NaiveDate;
 use dioxus::prelude::*;
 
 use crate::{
-    side::details::run_schedule::{markdown, Course, MeetingPoint, Schedule, Team},
-    storage::{Language, PlanConfigData},
+    side::details::run_schedule::{Course, MeetingPoint, Schedule, SheetInfo, Team},
+    storage::Language,
     ui::{AddressSVG, PersonSVG, PhoneSVG, StartSVG, WarningSVG},
 };
 
@@ -37,32 +37,9 @@ const LEAF_2: Asset = asset!("/assets/leaf_2.png");
 const CAKE: Asset = asset!("/assets/cake.png");
 const CARROT: Asset = asset!("/assets/carrot.png");
 
-fn strip_html(s: &str) -> String {
-    let mut result = String::new();
-    let mut inside_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => inside_tag = true,
-            '>' => inside_tag = false,
-            _ if !inside_tag => result.push(c),
-            _ => {}
-        }
-    }
-    result.trim().to_string()
-}
-
-pub async fn download(plan_title: String, team_name: String) {
-    let safe_title = strip_html(&plan_title)
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "");
-    let safe_name = strip_html(&team_name)
-        .replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', "\\n")
-        .replace('\r', "");
-
+/// Downloads the classic sheet as PNG. `file_name` is already cleaned (see `export::file_stem`).
+pub async fn download(file_name: String) {
+    let Ok(name) = serde_json::to_string(&format!("{file_name}.png")) else { return };
     let js = format!(
         r#"
         const el = document.getElementById('section-to-print');
@@ -72,7 +49,7 @@ pub async fn download(plan_title: String, team_name: String) {
         }}
         htmlToImage.toPng(el).then(dataUrl => {{
             const link = document.createElement('a');
-            link.download = '{safe_title}_{safe_name}.png';
+            link.download = {name};
             link.href = dataUrl;
             link.click();
         }}).catch(err => console.error('Download failed:', err));
@@ -82,17 +59,21 @@ pub async fn download(plan_title: String, team_name: String) {
 }
 
 #[component]
-pub fn RunSchedule(plan_config: PlanConfigData, schedule: Schedule) -> Element {
-    // Sanitized: title and description are user input rendered as HTML.
-    let titel_html = markdown::render(&plan_config.title);
-    let description_html = markdown::render(&plan_config.description);
+pub fn RunSchedule(
+    info: SheetInfo,
+    schedule: Schedule,
+    /// `id` of the sheet element. Only the off-screen sheet of "download all" sets another one.
+    #[props(default)]
+    sheet_id: Option<String>,
+) -> Element {
+    let sheet_id = sheet_id.unwrap_or_else(|| "section-to-print".to_string());
 
     rsx!(
         document::Script {
             src: HTML_TO_IMAGE
         }
         div {
-            id: "section-to-print",
+            id: "{sheet_id}",
             class: "flex justify-center w-full h-full bg-[#F8EFE1]",
             div { class: "space-y-8 w-full max-w-3xl",
                 div { class: "relative",
@@ -111,25 +92,23 @@ pub fn RunSchedule(plan_config: PlanConfigData, schedule: Schedule) -> Element {
                 }
                 div { class: "text-center",
                     h1 { class: "font-chewy text-8xl text-[#543D2B] tracking-wide",
-                        dangerous_inner_html:titel_html
+                        "{info.title}"
                     }
                 }
-
-                p { class: "font-gluten text-[#543D2B] mt-2", dangerous_inner_html:description_html }
 
                 // MyInfo
                 div { class: "grid grid-cols1 md:grid-cols-2 md:gap-x-4",
                     div {
-                        MyInfo {    language: plan_config.language.clone(),team: schedule.host }
+                        MyInfo { language: info.language.clone(), team: schedule.host }
                     }
                     div {
-                        MyHosting {   language: plan_config.language.clone(), guest_list: schedule.guest_list }
+                        MyHosting { language: info.language.clone(), guest_list: schedule.guest_list }
                     }
                 }
 
                 TimeLine {
-                    language: plan_config.language.clone(),
-                    cook_and_run_date: plan_config.date,
+                    language: info.language.clone(),
+                    cook_and_run_date: info.date,
                     start_point: schedule.start_point,
                     end_point: schedule.end_point,
                     walking_path: schedule.walking_path,
@@ -142,16 +121,15 @@ pub fn RunSchedule(plan_config: PlanConfigData, schedule: Schedule) -> Element {
 #[component]
 fn TimeLine(
     language: Language,
-    cook_and_run_date: NaiveDate,
+    cook_and_run_date: Option<NaiveDate>,
     start_point: Option<MeetingPoint>,
     end_point: Option<MeetingPoint>,
     walking_path: Vec<(Course, Team)>,
 ) -> Element {
-    let headline = format!(
-        "{} - {}",
-        TextModule::Timeline.get_text(&language),
-        cook_and_run_date
-    );
+    let headline = match cook_and_run_date {
+        Some(date) => format!("{} - {}", TextModule::Timeline.get_text(&language), date),
+        None => TextModule::Timeline.get_text(&language).to_string(),
+    };
 
     let start_name = start_point.as_ref().map_or("Start", |s| s.name.as_str());
     let start_time = start_point.as_ref().map_or("", |s| s.time.as_str());
